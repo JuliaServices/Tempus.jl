@@ -1,4 +1,4 @@
-module Example
+module ScheduledJobs
 export hello, domath
 
 """
