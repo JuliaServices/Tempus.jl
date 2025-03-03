@@ -268,10 +268,11 @@ Job(action::Function, name, schedule) = Job(name, schedule, action)
 mutable struct JobExecution
     const job::Job
     const scheduledStart::DateTime
+    runConcurrently::Bool
     actualStart::DateTime
     finish::DateTime
     status::Symbol
-    JobExecution(job::Job, scheduledStart::DateTime) = new(job, scheduledStart)
+    JobExecution(job::Job, scheduledStart::DateTime) = new(job, scheduledStart, false)
 end
 
 abstract type Store end
@@ -301,7 +302,8 @@ mutable struct Scheduler
     const jobExecutionFinished::Threads.Event
     const executingJobs::Set{Symbol}
     running::Bool
-    Scheduler(store::Store=InMemoryStore()) = new(ReentrantLock(), JobExecution[], store, Threads.Event(), Set{Symbol}(), false)
+    overlap_policy::Symbol # :skip, :queue, :concurrent
+    Scheduler(store::Store=InMemoryStore(), overlap_policy::Symbol=:skip) = new(ReentrantLock(), JobExecution[], store, Threads.Event(), Set{Symbol}(), false, overlap_policy)
 end
 
 function run!(scheduler::Scheduler)
@@ -318,25 +320,51 @@ function run!(scheduler::Scheduler)
         sort!(scheduler.jobExecutions, by=je -> je.scheduledStart)
     end
     # start scheduler job execution task
-    errormonitor(Threads.@spawn begin
-        readyToExecute = JobExecution[]
+    errormonitor(Threads.@spawn :interactive begin
+        readyToExecute = Tuple{Int, Bool, JobExecution}[]
         while true
             empty!(readyToExecute)
             now = trunc(Dates.now(UTC), Second)
             @lock scheduler.lock begin
                 scheduler.running || break
                 # check for jobs that are ready to execute
-                for je in scheduler.jobExecutions
+                for (i, je) in enumerate(scheduler.jobExecutions)
                     if je.scheduledStart <= now
-                        push!(readyToExecute, je)
-                        push!(scheduler.executingJobs, je.job.name)
+                        if je.job.name in scheduler.executingJobs
+                            if scheduler.overlap_policy == :skip
+                                push!(readyToExecute, (i, true, je))
+                            elseif scheduler.overlap_policy == :concurrent
+                                push!(readyToExecute, (i, false, je))
+                                je.runConcurrently = true
+                            elseif scheduler.overlap_policy == :queue
+                                @info "Job $(je.job.name) already executing, keeping scheduled execution queued until current execution finishes."
+                            end
+                        else
+                            push!(readyToExecute, (i, false, je))
+                            push!(scheduler.executingJobs, je.job.name)
+                        end
                     end
                 end
-                # remove job executions that are ready while holding the lock
-                foreach(_ -> popfirst!(scheduler.jobExecutions), readyToExecute)
+                # remove job executions that are ready or to be skipped while holding the lock and schedule next execution
+                if !isempty(readyToExecute)
+                    for (i, toSkip, je) in readyToExecute
+                        deleteat!(scheduler.jobExecutions, i)
+                        next = getnext(je.job.schedule)
+                        push!(scheduler.jobExecutions, JobExecution(je.job, next))
+                        if toSkip
+                            @info "Skipping job $(je.job.name) execution at $(now), next scheduled at $(next)"
+                        elseif je.runConcurrently
+                            @info "Executing job $(je.job.name) concurrently with previous execution at $(now), next scheduled at $(next)"
+                        else
+                            @info "Executing job $(je.job.name) at $(now), next scheduled at $(next)"
+                        end
+                    end
+                    sort!(scheduler.jobExecutions, by=je -> je.scheduledStart)
+                end
             end
+            filter!(x -> !x[2], readyToExecute)
             if !isempty(readyToExecute)
-                for je in readyToExecute
+                for (_, _, je) in readyToExecute
                     # we're ready to execute a job!
                     run!(scheduler, je, now)
                 end
@@ -351,7 +379,6 @@ function run!(scheduler::Scheduler)
 end
 
 function run!(scheduler::Scheduler, jobExecution::JobExecution, startTime::DateTime)
-    @info "Starting job execution at $(startTime) for job $(jobExecution.job.name)"
     jobExecution.actualStart = startTime
     errormonitor(Threads.@spawn begin
         try
@@ -367,14 +394,9 @@ function run!(scheduler::Scheduler, jobExecution::JobExecution, startTime::DateT
         storeJobExecution!(scheduler.store, jobExecution)
         # schedule the next job execution
         newJobExecution = JobExecution(jobExecution.job, getnext(jobExecution.job.schedule))
-        @info "Job $(jobExecution.job.name) execution finished at $(jobExecution.finish), scheduling next execution for $(newJobExecution.scheduledStart)."
+        @info "Job $(jobExecution.job.name) execution finished at $(jobExecution.finish)"
         @lock scheduler.lock begin
             delete!(scheduler.executingJobs, jobExecution.job.name)
-            if scheduler.running
-                #TODO: optimize this to avoid full sort
-                push!(scheduler.jobExecutions, newJobExecution)
-                sort!(scheduler.jobExecutions, by=je -> je.scheduledStart)
-            end
         end
     end)
     return
