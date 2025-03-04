@@ -206,15 +206,42 @@ end
     # Create a scheduler with default in-memory store.
     scheduler = Tempus.Scheduler()
 
-    # Start the scheduler.
-    Tempus.run!(scheduler)
+    try
+        Tempus.run!(scheduler)
 
-    # Schedule the test job.
-    push!(scheduler, test_job)
+        # Schedule the test job.
+        push!(scheduler, test_job)
 
-    # Job should run every second, so we wait for a few seconds and check if it ran.
-    sleep(3)  # wait for the job to run multiple times
-    @test length(executed[]) > 0
+        # Job should run every second, so we wait for a few seconds and check if it ran.
+        sleep(3)  # wait for the job to run multiple times
+        @test length(executed[]) > 0
+    finally
+        close(scheduler)
+    end
 
-    close(scheduler)
+    # simple FileStore
+    empty!(executed[])
+    mktemp() do path, io
+        fs = Tempus.FileStore(path)
+        sched = Tempus.Scheduler(fs)
+        try
+            Tempus.run!(sched)
+            push!(sched, test_job)
+            sleep(3)
+            @test length(executed[]) > 0
+        finally
+            close(sched)
+        end
+        # now run again, checking that our job was successfully persistent in the file
+        empty!(executed[])
+        fs = Tempus.FileStore(path)
+        sched = Tempus.Scheduler(fs)
+        try
+            Tempus.run!(sched)
+            sleep(3)
+            @test length(executed[]) > 0
+        finally
+            close(sched)
+        end
+    end
 end
