@@ -2,6 +2,8 @@ module Tempus
 
 using Dates, Logging, Serialization
 
+export withscheduler
+
 include("cron.jl")
 
 _some(x, y...) = x === nothing ? _some(y...) : x
@@ -9,13 +11,14 @@ _some(x) = x
 
 @kwdef struct JobOptions
     overlap_policy::Union{Symbol, Nothing} = nothing # :skip, :queue, :concurrent
-    retry_delays::Union{Base.ExponentialBackOff, Nothing} = nothing # see Base.ExponentialBackOff
+    retries::Int = 0
+    retry_delays::Union{Base.ExponentialBackOff, Nothing} = retries > 0 ? Base.ExponentialBackOff(; n=retries) : nothing # see Base.ExponentialBackOff
     retry_check = nothing # see Base.retry `check` keyword argument
     on_fail_policy::Union{Tuple{Symbol, Int}, Nothing} = nothing # :ignore, :disable, :unschedule + max consecutive failures for disable/unschedule
 end
 
 mutable struct Job
-    const name::Symbol
+    const name::String
     const schedule::Cron
     const action::Function
     const options::JobOptions
@@ -23,31 +26,38 @@ mutable struct Job
     disabledAt::Union{DateTime, Nothing}
 end
 
-Job(name, schedule, action::Function; kw...) = Job(Symbol(name), schedule isa Cron ? schedule : parseCron(schedule), action, JobOptions(kw...), nothing)
+Job(name, schedule, action::Function; kw...) = Job(string(name), schedule isa Cron ? schedule : parseCron(schedule), action, JobOptions(kw...), nothing)
 Job(action::Function, name, schedule; kw...) = Job(name, schedule, action; kw...)
 disable!(job::Job) = (job.disabledAt = Dates.now(UTC))
 enable!(job::Job) = (job.disabledAt = nothing)
+isdisabled(job::Job) = job.disabledAt !== nothing
 
 Base.hash(j::Job, h::UInt) = hash(j.name, h)
 
 mutable struct JobExecution
+    const jobExecutionId::String
     const job::Job
     const scheduledStart::DateTime
     runConcurrently::Bool
     actualStart::DateTime
     finish::DateTime
     status::Symbol # :succeeded, :failed
-    JobExecution(job::Job, scheduledStart::DateTime) = new(job, scheduledStart, false)
+    JobExecution(job::Job, scheduledStart::DateTime) = new("$(job.name)-$scheduledStart", job, scheduledStart, false)
 end
+
+Base.hash(je::JobExecution, h::UInt) = hash(je.jobExecutionId, h)
 
 abstract type Store end
 
+"Get all persisted jobs from `store`"
 function getJobs end
+"Persist `job` in `store`"
 function addJob! end
+"Remove `job` from `store`; does *not* remove job execution history from store"
 function removeJob! end
 
 # fallback for removing job by name
-function removeJob!(store::Store, jobName::Symbol)
+function removeJob!(store::Store, jobName::String)
     jobs = getJobs(store)
     job = findfirst(j -> j.name == jobName, jobs)
     job === nothing && return
@@ -55,20 +65,33 @@ function removeJob!(store::Store, jobName::Symbol)
     return
 end
 
+function disableJob!(store::Store, job::Union{Job, String})
+    jobName = job isa Job ? job.name : job
+    jobs = getJobs(store)
+    job = findfirst(j -> j.name == jobName, jobs)
+    job === nothing && return
+    disable!(job)
+    return
+end
+
+"Store `jobExecution` in `store`"
 function storeJobExecution! end
+"Get the `n` most recent job executions persisted in `store`"
 function getNMostRecentJobExecutions end
+"Completely remove all job execution history by job name (String)"
+function removeJobExecutions! end
 
 struct InMemoryStore <: Store
     jobs::Set{Job}
-    jobExecutions::Dict{Symbol, Vector{JobExecution}} # job executions stored most recent first
+    jobExecutions::Dict{String, Vector{JobExecution}} # job executions stored most recent first
 end
 
-InMemoryStore() = InMemoryStore(Set{Job}(), Dict{Symbol, Vector{JobExecution}}())
+InMemoryStore() = InMemoryStore(Set{Job}(), Dict{String, Vector{JobExecution}}())
 
 addJob!(store::InMemoryStore, job::Job) = push!(store.jobs, job)
 removeJob!(store::InMemoryStore, job::Job) = delete!(store.jobs, job)
 getJobs(store::InMemoryStore) = store.jobs
-function getNMostRecentJobExecutions(store::InMemoryStore, jobName::Symbol, n::Int)
+function getNMostRecentJobExecutions(store::InMemoryStore, jobName::String, n::Int)
     execs = get(() -> JobExecution[], store.jobExecutions, jobName)
     return @view execs[1:min(n, length(execs))]
 end
@@ -76,6 +99,11 @@ end
 function storeJobExecution!(store::InMemoryStore, jobExecution::JobExecution)
     execs = get!(() -> JobExecution[], store.jobExecutions, jobExecution.job.name)
     pushfirst!(execs, jobExecution)
+    return
+end
+
+function removeJobExecutions!(store::InMemoryStore, jobName::String)
+    delete!(store.jobExecutions, jobName)
     return
 end
 
@@ -92,7 +120,7 @@ end
 addJob!(store::FileStore, job::Job) = addJob!(store.store, job)
 removeJob!(store::FileStore, job::Job) = removeJob!(store.store, job)
 getJobs(store::FileStore) = getJobs(store.store)
-getNMostRecentJobExecutions(store::FileStore, jobName::Symbol, n::Int) = getNMostRecentJobExecutions(store.store, jobName, n)
+getNMostRecentJobExecutions(store::FileStore, jobName::String, n::Int) = getNMostRecentJobExecutions(store.store, jobName, n)
 
 function storeJobExecution!(store::FileStore, jobExecution::JobExecution)
     storeJobExecution!(store.store, jobExecution)
@@ -100,21 +128,35 @@ function storeJobExecution!(store::FileStore, jobExecution::JobExecution)
     return
 end
 
+removeJobExecutions!(store::FileStore, jobName::String) = removeJobExecutions!(store.store, jobName)
+
 mutable struct Scheduler
     const lock::ReentrantLock
     const jobExecutions::Vector{JobExecution}
     const store::Store
     const jobExecutionFinished::Threads.Event
-    const executingJobs::Set{Symbol}
+    const executingJobExecutions::Set{JobExecution}
     running::Bool
     const jobOptions::JobOptions
     Scheduler(
         store::Store=InMemoryStore();
         overlap_policy::Symbol=:skip,
-        retry_delays::Union{Base.ExponentialBackOff, Nothing}=Base.ExponentialBackOff(; n=3),
+        retries::Int = 3,
+        retry_delays::Union{Base.ExponentialBackOff, Nothing}=retries == 0 ? nothing : Base.ExponentialBackOff(; n=retries),
         retry_check=nothing,
         on_fail_policy::Union{Tuple{Symbol, Int}, Nothing}=(:ignore, 0),
-    ) = new(ReentrantLock(), JobExecution[], store, Threads.Event(), Set{Symbol}(), false, JobOptions(; overlap_policy, retry_delays, retry_check, on_fail_policy))
+    ) = new(ReentrantLock(), JobExecution[], store, Threads.Event(), Set{JobExecution}(), false, JobOptions(; overlap_policy, retries, retry_delays, retry_check, on_fail_policy))
+end
+
+function removeJob!(scheduler::Scheduler, job::Union{Job, String})
+    jobName = job isa Job ? job.name : job
+    @lock scheduler.lock begin
+        # find job executions for job to remove
+        inds = findall(je -> je.job.name == jobName, scheduler.jobExecutions)
+        # remove job executions
+        deleteat!(scheduler.jobExecutions, inds)
+    end
+    return
 end
 
 function checkDisable!(scheduler::Scheduler, store::Store, job::Job, on_fail_policy::Union{Tuple{Symbol, Int}, Nothing})
@@ -123,11 +165,15 @@ function checkDisable!(scheduler::Scheduler, store::Store, job::Job, on_fail_pol
     if all(e -> e.status == :failed, execs)
         if on_fail_policy[1] === :disable
             disable!(job)
-            @info "Disabling job $(job.name) after $(on_fail_policy[2]) consecutive failures."
+            n = on_fail_policy[2]
+            @info "Disabling job $(job.name) after $(n) $(n == 1 ? "failure." : "consecutive failures.")"
             return :disabled
         elseif on_fail_policy[1] === :unschedule
+            # unscheduling due to failure also disables job
+            disable!(job)
             unschedule!(scheduler, job)
-            @info "Unscheduling job $(job.name) after $(on_fail_policy[2]) consecutive failures."
+            n = on_fail_policy[2]
+            @info "Unscheduling job $(job.name) after $(n) $(n == 1 ? "failure." : "consecutive failures.")"
             return :unscheduled
         end
     end
@@ -141,6 +187,7 @@ function run!(scheduler::Scheduler)
     # generate initial JobExecution list
     @lock scheduler.lock begin
         scheduler.running = true
+        empty!(scheduler.executingJobExecutions)
         empty!(scheduler.jobExecutions)
         for job in jobs
             # recalculate disabled status for job based on on_fail_policy and job execution history
@@ -162,18 +209,27 @@ function run!(scheduler::Scheduler)
                     if je.scheduledStart <= now
                         if je.job.disabledAt !== nothing
                             push!(readyToExecute, (i, true, je))
-                        elseif je.job.name in scheduler.executingJobs
+                        elseif any(j -> j.job.name == je.job.name, scheduler.executingJobExecutions)
                             if _some(je.job.options.overlap_policy, scheduler.jobOptions.overlap_policy) == :skip
                                 push!(readyToExecute, (i, true, je))
                             elseif _some(je.job.options.overlap_policy, scheduler.jobOptions.overlap_policy) == :concurrent
                                 push!(readyToExecute, (i, false, je))
+                                push!(scheduler.executingJobExecutions, je)
                                 je.runConcurrently = true
                             elseif _some(je.job.options.overlap_policy, scheduler.jobOptions.overlap_policy) == :queue
-                                @info "Job $(je.job.name) already executing, keeping scheduled execution queued until current execution finishes."
+                                nexecs = count(j -> j.job.name == je.job.name, scheduler.jobExecutions)
+                                @warn "Job $(je.job.name) already executing, keeping scheduled execution queued until current execution finishes. There are $nexecs queued for this job."
+                                # check if we need to schedule the next execution
+                                next = getnext(je.job.schedule)
+                                if any(j -> j.job.name == je.job.name && j.scheduledStart == next, scheduler.jobExecutions)
+                                    # we've already scheduled this execution, skip
+                                else
+                                    push!(scheduler.jobExecutions, JobExecution(je.job, next))
+                                end
                             end
                         else
                             push!(readyToExecute, (i, false, je))
-                            push!(scheduler.executingJobs, je.job.name)
+                            push!(scheduler.executingJobExecutions, je)
                         end
                     end
                 end
@@ -182,13 +238,14 @@ function run!(scheduler::Scheduler)
                     for (i, toSkip, je) in readyToExecute
                         deleteat!(scheduler.jobExecutions, i)
                         next = getnext(je.job.schedule)
-                        push!(scheduler.jobExecutions, JobExecution(je.job, next))
+                        newje = JobExecution(je.job, next)
+                        push!(scheduler.jobExecutions, newje)
                         if je.job.disabledAt !== nothing
-                            @info "Skipping disabled job $(je.job.name) (disabled at $(je.job.disabledAt)) execution at $(now), next scheduled at $(next)"
+                            @info "[$(newje.jobExecutionId)]: Skipping disabled job $(je.job.name) (disabled at $(je.job.disabledAt)) execution at $(now), next scheduled at $(next)"
                         elseif toSkip
-                            @info "Skipping job $(je.job.name) execution at $(now), next scheduled at $(next)"
+                            @info "[$(newje.jobExecutionId)]: Skipping job $(je.job.name) execution at $(now), next scheduled at $(next)"
                         else
-                            @info "Job $(je.job.name) execution scheduled at $(next)"
+                            @info "[$(newje.jobExecutionId)]: Job $(je.job.name) execution scheduled at $(next)"
                         end
                     end
                     sort!(scheduler.jobExecutions, by=je -> je.scheduledStart)
@@ -214,12 +271,21 @@ function run!(scheduler::Scheduler, jobExecution::JobExecution)
     errormonitor(Threads.@spawn begin
         now = Dates.now(UTC)
         if jobExecution.runConcurrently
-            @info "Executing job $(jobExecution.job.name) concurrently with previous execution at $(now)"
+            @info "[$(jobExecution.jobExecutionId)]: Executing job $(jobExecution.job.name) concurrently with previous execution at $(now)"
         else
-            @info "Executing job $(jobExecution.job.name) at $(now)"
+            @info "[$(jobExecution.jobExecutionId)]: Executing job $(jobExecution.job.name) at $(now)"
+        end
+        retry_check = _some(jobExecution.job.options.retry_check, scheduler.jobOptions.retry_check)
+        check = (eb, e) -> begin
+            if isdisabled(jobExecution.job)
+                @info "[$(jobExecution.jobExecutionId)]: Skipping job $(jobExecution.job.name) retry due to job being disabled"
+                return false
+            end
+            @warn "[$(jobExecution.jobExecutionId)]: Job $(jobExecution.job.name) execution failed, retrying" exception=(e, catch_backtrace())
+            return retry_check !== nothing ? retry_check(eb, e) : true
         end
         f = _some(jobExecution.job.options.retry_delays, scheduler.jobOptions.retry_delays) !== nothing ?
-            Base.retry(jobExecution.job.action; delays=_some(jobExecution.job.options.retry_delays, scheduler.jobOptions.retry_delays), check=_some(jobExecution.job.options.retry_check, scheduler.jobOptions.retry_check)) :
+            Base.retry(jobExecution.job.action; delays=_some(jobExecution.job.options.retry_delays, scheduler.jobOptions.retry_delays), check=check) :
             jobExecution.job.action
         jobExecution.actualStart = now
         try
@@ -227,10 +293,10 @@ function run!(scheduler::Scheduler, jobExecution::JobExecution)
             jobExecution.status = :succeeded
         catch e
             jobExecution.status = :failed
-            @error "Job $(jobExecution.job.name) execution failed" exception=(e, catch_backtrace())
+            @error "[$(jobExecution.jobExecutionId)]: Job $(jobExecution.job.name) execution failed" exception=(e, catch_backtrace())
         finally
             jobExecution.finish = Dates.now(UTC)
-            @info "Job $(jobExecution.job.name) execution finished at $(jobExecution.finish)"
+            @info "[$(jobExecution.jobExecutionId)]: Job $(jobExecution.job.name) execution finished at $(jobExecution.finish)"
         end
         # store the job execution
         storeJobExecution!(scheduler.store, jobExecution)
@@ -239,21 +305,21 @@ function run!(scheduler::Scheduler, jobExecution::JobExecution)
             checkDisable!(scheduler, scheduler.store, jobExecution.job, _some(jobExecution.job.options.on_fail_policy, scheduler.jobOptions.on_fail_policy))
         end
         @lock scheduler.lock begin
-            delete!(scheduler.executingJobs, jobExecution.job.name)
+            delete!(scheduler.executingJobExecutions, jobExecution)
         end
     end)
     return
 end
 
+currentlyExecutionJobs(sch::Scheduler) = [je.jobExecutionId for je in sch.executingJobExecutions]
+
 function Base.close(scheduler::Scheduler)
     @info "Closing scheduler and stopping job execution."
-    @lock scheduler.lock begin
-        scheduler.running = false
-    end
     # check for any executing jobs
     while true
         @lock scheduler.lock begin
-            isempty(scheduler.executingJobs) && break
+            scheduler.running = false
+            isempty(scheduler.executingJobExecutions) && break
         end
         @debug "Waiting for executing jobs to finish."
         sleep(0.5)
@@ -264,16 +330,18 @@ function Base.close(scheduler::Scheduler)
 end
 
 function Base.push!(scheduler::Scheduler, job::Job)
-    @info "Adding job $(job.name) to scheduler and scheduling next execution."
     @lock scheduler.lock begin
         addJob!(scheduler.store, job)
-        push!(scheduler.jobExecutions, JobExecution(job, getnext(job.schedule)))
+        next = getnext(job.schedule)
+        je = JobExecution(job, next)
+        push!(scheduler.jobExecutions, je)
+        @info "[$(je.jobExecutionId)]: Adding job $(job.name) to scheduler and scheduling next execution at $(next)."
         sort!(scheduler.jobExecutions, by=je -> je.scheduledStart)
     end
     return job
 end
 
-function unschedule!(scheduler::Scheduler, job::Union{Job, Symbol})
+function unschedule!(scheduler::Scheduler, job::Union{Job, String})
     jobName = job isa Job ? job.name : job
     @info "Removing job $(jobName) from scheduler."
     @lock scheduler.lock begin
@@ -281,6 +349,16 @@ function unschedule!(scheduler::Scheduler, job::Union{Job, Symbol})
         removeJob!(scheduler, job)
     end
     return job
+end
+
+function withscheduler(f, args...; kw...)
+    scheduler = Scheduler(args...; kw...)
+    try
+        run!(scheduler)
+        f(scheduler)
+    finally
+        close(scheduler)
+    end
 end
 
 end # module

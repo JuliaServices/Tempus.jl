@@ -3,7 +3,6 @@ using Test, Dates, Tempus
 import Tempus: parseCronField, parseCron, getnext
 
 @testset "parseCronField Tests" begin
-
     # Wildcard: should parse "*" into a Wildcard type.
     @testset "Wildcard" begin
         cf = parseCronField("*")
@@ -66,7 +65,7 @@ end
 @testset "parseCron" begin
     cron = "* * * * *"
     cronObj = parseCron(cron)
-    @test cronObj.second isa Tempus.Wildcard
+    @test cronObj.second == Tempus.Numeric(0)
     @test cronObj.minute isa Tempus.Wildcard
     @test cronObj.hour isa Tempus.Wildcard
     @test cronObj.day_of_month isa Tempus.Wildcard
@@ -75,7 +74,7 @@ end
 
     cron = "*/15 * * * *"
     cronObj = parseCron(cron)
-    @test cronObj.second isa Tempus.Wildcard
+    @test cronObj.second == Tempus.Numeric(0)
     @test cronObj.minute isa Tempus.Step
     @test cronObj.minute.step == 15
     @test cronObj.minute.range isa Tempus.Wildcard
@@ -92,6 +91,38 @@ end
     @test next == DateTime(2021, 1, 1, 0, 1, 0)
 
     # more test cases here
+    cron = parseCron("*/15 * * * *")
+    dt = DateTime(2021, 1, 1, 0, 12, 0)
+    next = getnext(cron, dt)
+    @test next == DateTime(2021, 1, 1, 0, 15, 0)
+
+    dt_edge = DateTime(2021, 1, 1, 0, 14, 59)
+    next_edge = getnext(cron, dt_edge)
+    @test next_edge == DateTime(2021, 1, 1, 0, 15, 0)
+
+    dt_edge = DateTime(2021, 1, 1, 0, 15, 0)
+    next_edge = getnext(cron, dt_edge)
+    @test next_edge == DateTime(2021, 1, 1, 0, 30, 0)
+
+    cron = parseCron("0 0 1 * *")
+    dt = DateTime(2021, 1, 1, 0, 0, 0)
+    next = getnext(cron, dt)
+    @test next == DateTime(2021, 2, 1, 0, 0, 0)
+
+    cron = parseCron("0 0 1 * *")
+    dt = DateTime(2021, 1, 31, 23, 59, 59)
+    next_edge_case = getnext(cron, dt)
+    @test next_edge_case == DateTime(2021, 2, 1, 0, 0, 0)
+
+    cron = parseCron("0 0 1 * *")
+    dt = DateTime(2020, 2, 29, 23, 59, 59)
+    next_edge_case = getnext(cron, dt)
+    @test next_edge_case == DateTime(2020, 3, 1, 0, 0, 0)
+
+    cron = parseCron("0 0 1 1 *")
+    dt = DateTime(2020, 1, 1, 0, 0, 0)
+    next_case = getnext(cron, dt)
+    @test next_case == DateTime(2021, 1, 1, 0, 0, 0)
 end
 
 @testset "getnext Edge Cases" begin
@@ -198,50 +229,156 @@ end
 
 @testset "Scheduler Scheduling and Execution" begin
     # We'll create a simple job that records its execution time.
-    executed = Ref{Vector{DateTime}}([])
+    executed = DateTime[]
     test_job = Tempus.Job(:testjob, "* * * * * *") do
-        push!(executed[], Dates.now(UTC))
+        push!(executed, Dates.now(UTC))
     end
-
-    # Create a scheduler with default in-memory store.
-    scheduler = Tempus.Scheduler()
-
-    try
-        Tempus.run!(scheduler)
-
+    withscheduler() do sch
         # Schedule the test job.
-        push!(scheduler, test_job)
-
+        push!(sch, test_job)
         # Job should run every second, so we wait for a few seconds and check if it ran.
-        sleep(3)  # wait for the job to run multiple times
-        @test length(executed[]) > 0
-    finally
-        close(scheduler)
+        sleep(2)  # wait for the job to run multiple times
     end
+    @test length(executed) > 0
+    # disabled job doesn't run
+    empty!(executed)
+    Tempus.disable!(test_job)
+    withscheduler() do sch
+        push!(sch, test_job)
+        sleep(2)  # wait for the job to run multiple times if it was enabled
+    end
+    @test length(executed) == 0
+    # re-enable
+    empty!(executed)
+    Tempus.enable!(test_job)
+    withscheduler() do sch
+        push!(sch, test_job)
+        sleep(2)  # wait for the job to run multiple times
+    end
+    @test length(executed) > 0
+    # overlap policy
+    # skip
+    # job that takes 2 seconds to run, but runs every second
+    sleep_job = Tempus.Job(:sleepjob, "* * * * * *") do
+        sleep(2)
+        push!(executed, Dates.now(UTC))
+    end
+    empty!(executed)
+    withscheduler(; overlap_policy=:skip) do sch
+        push!(sch, sleep_job)
+        sleep(2.5)  # wait for the job to run once
+    end
+    @test length(executed) == 1
+    # concurrent
+    empty!(executed)
+    withscheduler(; overlap_policy=:concurrent) do sch
+        push!(sch, sleep_job)
+        sleep(2.5)  # wait for the job to run once
+    end
+    @test length(executed) == 2
+    # queue
+    empty!(executed)
+    withscheduler(; overlap_policy=:queue) do sch
+        push!(sch, sleep_job)
+        sleep(3.5)  # wait for the job to start executing twice sequentially
+    end
+    @test length(executed) == 2
+    # retry settings
+    # retry n times
+    fail_job = Tempus.Job(:failjob, "* * * * * *") do
+        println("length(executed): ", length(executed))
+        if length(executed) < 2
+            push!(executed, Dates.now(UTC))
+            error("Job failed")
+        end
+    end
+    empty!(executed)
+    withscheduler(; retries=2) do sch
+        push!(sch, fail_job)
+        sleep(3)  # wait for the job to run multiple times
+    end
+    @test length(executed) == 2
+    # retry check
+    toggle = Ref{Bool}(true)
+    retry_check = (s, e) -> begin
+        if toggle[] 
+            println("Retry triggered")
+            toggle[] = false
+            return true
+        else
+            println("Retry not triggered")
+            return false
+        end
+    end
+    empty!(executed)
+    withscheduler(; retries=2, retry_check=retry_check) do sch
+        push!(sch, fail_job)
+        sleep(3)  # wait for the job to run multiple times
+    end
+    @test length(executed) == 2
+    @test toggle[] == false
+    # on_fail_policy
+    # ignore
+    always_fail_job = Tempus.Job(:failjob, "* * * * * *") do
+        push!(executed, Dates.now(UTC))
+        error("always fail job")
+    end
+    empty!(executed)
+    withscheduler(; on_fail_policy=(:ignore, 0)) do sch
+        push!(sch, always_fail_job)
+        sleep(4)  # wait for the job to run multiple times
+    end
+    @test length(executed) > 4 # job should run every second + retries, but never get disabled
+    # on_fail_policy disable job after 1 failure
+    empty!(executed)
+    Tempus.enable!(always_fail_job)
+    withscheduler(; retries=0, on_fail_policy=(:disable, 1)) do sch
+        push!(sch, always_fail_job)
+        sleep(4)  # wait to verify job does not run
+    end
+    @test length(executed) == 1 # job ran once, failed, and was disabled
+    @test Tempus.isdisabled(always_fail_job)
+    # on_fail_policy unschedule the job after 1 failure
+    empty!(executed)
+    Tempus.enable!(always_fail_job)
+    withscheduler(; retries=0, on_fail_policy=(:unschedule, 1)) do sch
+        push!(sch, always_fail_job)
+        sleep(3)  # wait job to run, fail, and be unscheduled and ensure it isn't run again
+        @test all(je -> je.job.name != always_fail_job.name, sch.jobExecutions)
+    end
+    @test length(executed) == 1 # job ran once, failed, and was unscheduled
+
+    # if execution is being retried n times and job gets disabled/unscheduled, retries are stopped
+
+    # dyanmically schedule and unschedule multiple jobs
+
+    # test job stores
+    # InMemoryStore
+
+    # test the job is dynamically added to store
+
+    # job is automatically started when persisted in store
+
+    # if job is disabled, it persists through scheduler restart
+
+
 
     # simple FileStore
-    empty!(executed[])
+    empty!(executed)
     mktemp() do path, io
         fs = Tempus.FileStore(path)
-        sched = Tempus.Scheduler(fs)
-        try
-            Tempus.run!(sched)
-            push!(sched, test_job)
+        withscheduler(fs) do sch
+            push!(sch, test_job)
             sleep(3)
-            @test length(executed[]) > 0
-        finally
-            close(sched)
         end
-        # now run again, checking that our job was successfully persistent in the file
-        empty!(executed[])
+        @test length(executed) > 0
+        # now run again, checking that our job was successfully persisted in the file
+        empty!(executed)
         fs = Tempus.FileStore(path)
-        sched = Tempus.Scheduler(fs)
-        try
-            Tempus.run!(sched)
+        withscheduler(fs) do sch
             sleep(3)
-            @test length(executed[]) > 0
-        finally
-            close(sched)
         end
+        @show executed
+        @test length(executed) > 0
     end
 end

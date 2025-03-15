@@ -1,63 +1,75 @@
+## Representation of a day of the week as a custom Dates.Period
 struct DayOfWeek <: Dates.Period
     value::Int
 end
 
-allowedrange(::Type{P}) where {P <: Union{Second, Minute}} = P(0):P(59)
-allowedrange(::Type{Hour}) = P(0):P(23)
-allowedrange(::Type{Day}) = P(1):P(31)
-allowedrange(::Type{Month}) = P(1):P(12)
-allowedrange(::Type{DayOfWeek}) = P(0):P(6)
+## Returns the allowed range of values for different time periods
+allowedrange(::Type{P}) where {P <: Union{Second, Minute}} = P(0):P(1):P(59)
+allowedrange(::Type{Hour}) = Hour(0):Hour(1):Hour(23)
+allowedrange(::Type{Day}) = Day(1):Day(1):Day(31)
+allowedrange(::Type{Month}) = Month(1):Month(1):Month(12)
+allowedrange(::Type{DayOfWeek}) = DayOfWeek(0):DayOfWeek(1):DayOfWeek(6)
+
+function allowed end
+function nextallowed end
+function minimumallowed end
+function valid end
 
 abstract type CronField end
 
+## Represents a wildcard (`*`) in a cron expression
 struct Wildcard <: CronField end
 
+Base.show(io::IO, ::Wildcard) = print(io, "*")
+
+## Determines if a period `p` is allowed based on cron field definitions
 allowed(::Period, ::Wildcard, ::Period, ::Wildcard) = true
 allowed(p::Period, x::CronField, ::Period, ::Wildcard) = allowed(p, x)
 allowed(::Period, ::Wildcard, q::Period, y::CronField) = allowed(q, y)
 allowed(p::Period, x::CronField, q::Period, y::CronField) = allowed(p, x) || allowed(q, y)
 
-allowed(p::Period, ::Wildcard) = true
+allowed(p::P, ::Wildcard) where {P <: Period} = p in allowedrange(P)
+valid(::Type{P}, ::Wildcard) where {P <: Period} = true
+
+## Returns the next allowed value of period `p` according to cron field definitions
 nextallowed(p::Period, ::Wildcard) = p
+
+## Returns the minimum allowed value for different period types based on a wildcard definition
 minimumallowed(::Type{P}, ::Wildcard) where {P <: Union{Second, Minute, Hour}} = P(0)
 minimumallowed(::Type{P}, ::Wildcard) where {P <: Union{Day, Month}} = P(1)
 
+## Represents a numeric value in a cron expression
 struct Numeric <: CronField
     value::Int
 end
 
+Base.show(io::IO, x::Numeric) = print(io, x.value)
+
 allowed(p::P, x::Numeric) where {P <: Period} = p == P(x.value)
 nextallowed(_::P, x::Numeric) where {P <: Period} = P(x.value)
 minimumallowed(::Type{P}, x::Numeric) where {P <: Period} = P(x.value)
+valid(::Type{P}, x::Numeric) where {P <: Period} = P(x.value) in allowedrange(P)
 
+## Represents a range of values in a cron expression (e.g., `5-10`)
 struct Range <: CronField
     start::Int
     stop::Int
 end
-    
+
+Base.show(io::IO, x::Range) = print(io, x.start, "-", x.stop)
+
 allowed(p::P, x::Range) where {P <: Period} = P(x.start) <= p <= P(x.stop)
 nextallowed(p::P, x::Range) where {P <: Period} = allowed(p, x) ? p : P(x.start)
 minimumallowed(::Type{P}, x::Range) where {P <: Period} = P(x.start)
+valid(::Type{P}, x::Range) where {P <: Period} = P(x.start) in allowedrange(P) && P(x.stop) in allowedrange(P)
 
-struct Step <: CronField
-    range::Union{Range, Wildcard}
-    step::Int
-end
-
-function nextallowed(p::P, x::Step) where {P <: Period}
-    #TODO
-    if x.range isa Wildcard
-
-    else
-
-    end
-end
-minimumallowed(::Type{P}, x::Step) where {P <: Period} = minimumallowed(P, x.range)
-
+## Represents a list of discrete values in a cron expression (e.g., `1,3,5`)
 struct List <: CronField
     values::Vector{Int}
     List(values::Vector{Int}) = new(sort!(values))
 end
+
+Base.show(io::IO, x::List) = print(io, join(x.values, ","))
 
 allowed(p::P, x::List) where {P <: Period} = any(==(P(p)), x.values)
 function nextallowed(p::P, x::List) where {P <: Period}
@@ -67,7 +79,29 @@ function nextallowed(p::P, x::List) where {P <: Period}
     return P(x.values[1])
 end
 minimumallowed(::Type{P}, x::List) where {P <: Period} = P(x.values[1])
+valid(::Type{P}, x::List) where {P <: Period} = all(P(v) in allowedrange(P) for v in x.values)
 
+## Represents a stepped range (e.g., `*/5` or `1-10/2`
+struct Step <: CronField
+    range::Union{Range, Wildcard}
+    step::Int
+end
+
+Base.show(io::IO, x::Step) = print(io, x.range isa Wildcard ? "*" : "$(x.range.start)-$(x.range.stop)", "/", x.step)
+
+allowed(p::P, x::Step) where {P <: Period} = allowed(p, x.range) && p % P(x.step) == P(0)
+function nextallowed(p::P, x::Step) where {P <: Period}
+    # if p is already a multiple of the step, return p
+    p % P(x.step) == P(0) && return p
+    # otherwise, find the next multiple of the step
+    v = p + P(P(x.step) - p % P(x.step))
+    # if the next multiple is greater than the maximum allowed value, return the minimum allowed value
+    return allowed(v, x.range) ? v : minimumallowed(P, x.range)
+end
+minimumallowed(::Type{P}, x::Step) where {P <: Period} = minimumallowed(P, x.range)
+valid(::Type{P}, x::Step) where {P <: Period} = valid(P, x.range) && P(x.step) in allowedrange(P)
+
+## Represents a parsed cron expression with individual fields for each unit of time
 struct Cron{S, M, H, D, Mo, DoW}
     second::S
     minute::M
@@ -75,6 +109,22 @@ struct Cron{S, M, H, D, Mo, DoW}
     day_of_month::D
     month::Mo
     day_of_week::DoW
+end
+
+function Base.show(io::IO, c::Cron)
+    print(io, "\"")
+    show(io, c.second)
+    print(io, " ")
+    show(io, c.minute)
+    print(io, " ")
+    show(io, c.hour)
+    print(io, " ")
+    show(io, c.day_of_month)
+    print(io, " ")
+    show(io, c.month)
+    print(io, " ")
+    show(io, c.day_of_week)
+    print(io, "\"")
 end
 
 # parse an individual cron expression field
@@ -102,9 +152,8 @@ function parseCronField(field)
     end
     # step
     if occursin(r"^(?:\*|\d+-\d+)(?:/\d+)$", field)
-        error("not yet supported")
-        # parts = split(field, "/")
-        # return Step(parseCronField(parts[1]), parse(Int, parts[2]))
+        parts = split(field, "/")
+        return Step(parseCronField(parts[1]), parse(Int, parts[2]))
     end
     # list
     if occursin(r"^\d+(,\d+)+$", field)
@@ -124,22 +173,22 @@ function parseCron(cron::String)
         throw(ArgumentError("Invalid cron expression: $cron"))
     end
     # validate cron fields (seconds in range 0-59, minutes in range 0-59, hours in range 0-23, day of month in range 1-31, month in range 1-12, day of week in range 0-6)
-    if !(second isa Wildcard || (second isa Numeric && 0 <= second.value < 60))
+    if !valid(Second, second)
         throw(ArgumentError("Invalid seconds value: $second"))
     end
-    if !(minute isa Wildcard || (minute isa Numeric && 0 <= minute.value < 60))
+    if !valid(Minute, minute)
         throw(ArgumentError("Invalid minutes value: $minute"))
     end
-    if !(hour isa Wildcard || (hour isa Numeric && 0 <= hour.value < 24))
+    if !valid(Hour, hour)
         throw(ArgumentError("Invalid hours value: $hour"))
     end
-    if !(day_of_week isa Wildcard || (day_of_week isa Numeric && 0 <= day_of_week.value < 7))
+    if !valid(DayOfWeek, day_of_week)
         throw(ArgumentError("Invalid day of week value: $day_of_week"))
     end
-    if !(day isa Wildcard || (day isa Numeric && 1 <= day.value <= 31))
+    if !valid(Day, day)
         throw(ArgumentError("Invalid day of month value: $day"))
     end
-    if !(month isa Wildcard || (month isa Numeric && 1 <= month.value <= 12))
+    if !valid(Month, month)
         throw(ArgumentError("Invalid month value: $month"))
     end
     return Cron(second, minute, hour, day, month, day_of_week)
