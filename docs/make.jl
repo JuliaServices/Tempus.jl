@@ -1,5 +1,5 @@
-using Documenter, Example
+using Documenter, Tempus
 
-makedocs(modules = [Example], sitename = "Example.jl")
+makedocs(modules = [Tempus], sitename = "Tempus.jl")
 
-deploydocs(repo = "github.com/quinnj/Example.jl.git", push_preview = true)
+deploydocs(repo = "github.com/JuliaServices/Tempus.jl.git", push_preview = true)
