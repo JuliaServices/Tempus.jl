@@ -226,11 +226,14 @@ end
 end
 
 # -- Higher-Level Tests for Scheduler --
+# we make this a global variable so we can access it in the test cases
+# even when a job gets serialized/deserialized for a file store
+executed = DateTime[]
 
 @testset "Scheduler Scheduling and Execution" begin
     # We'll create a simple job that records its execution time.
-    executed = DateTime[]
     test_job = Tempus.Job(:testjob, "* * * * * *") do
+        global executed
         push!(executed, Dates.now(UTC))
     end
     withscheduler() do sch
@@ -360,8 +363,6 @@ end
     # job is automatically started when persisted in store
 
     # if job is disabled, it persists through scheduler restart
-
-
 
     # simple FileStore
     empty!(executed)
