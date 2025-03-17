@@ -232,7 +232,7 @@ executed = DateTime[]
 
 @testset "Scheduler Scheduling and Execution" begin
     # We'll create a simple job that records its execution time.
-    test_job = Tempus.Job(:testjob, "* * * * * *") do
+    test_job = Tempus.Job("testjob", "* * * * * *") do
         global executed
         push!(executed, Dates.now(UTC))
     end
@@ -262,7 +262,7 @@ executed = DateTime[]
     # overlap policy
     # skip
     # job that takes 2 seconds to run, but runs every second
-    sleep_job = Tempus.Job(:sleepjob, "* * * * * *") do
+    sleep_job = Tempus.Job("sleepjob", "* * * * * *") do
         sleep(2)
         push!(executed, Dates.now(UTC))
     end
@@ -288,7 +288,7 @@ executed = DateTime[]
     @test length(executed) == 2
     # retry settings
     # retry n times
-    fail_job = Tempus.Job(:failjob, "* * * * * *") do
+    fail_job = Tempus.Job("failjob", "* * * * * *") do
         println("length(executed): ", length(executed))
         if length(executed) < 2
             push!(executed, Dates.now(UTC))
@@ -322,7 +322,7 @@ executed = DateTime[]
     @test toggle[] == false
     # on_fail_policy
     # ignore
-    always_fail_job = Tempus.Job(:failjob, "* * * * * *") do
+    always_fail_job = Tempus.Job("failjob", "* * * * * *") do
         push!(executed, Dates.now(UTC))
         error("always fail job")
     end

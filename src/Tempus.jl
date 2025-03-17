@@ -31,6 +31,8 @@ Defines options for job execution behavior.
 - `retry_delays::Union{Base.ExponentialBackOff, Nothing}`: Delay strategy for retries (defaults to exponential backoff if `retries > 0`).
 - `retry_check`: Custom function to determine retry behavior (`check` argument from `Base.retry`).
 - `on_fail_policy::Union{Tuple{Symbol, Int}, Nothing}`: Determines job failure handling (`:ignore`, `:disable`, `:unschedule`), with a threshold for consecutive failures.
+- `max_executions::Union{Int, Nothing}`: Maximum number of executions allowed for a job.
+- `expires_at::Union{DateTime, Nothing}`: Expiration time for a job.
 """
 @kwdef struct JobOptions
     overlap_policy::Union{Symbol, Nothing} = nothing # :skip, :queue, :concurrent
@@ -38,6 +40,8 @@ Defines options for job execution behavior.
     retry_delays::Union{Base.ExponentialBackOff, Nothing} = retries > 0 ? Base.ExponentialBackOff(; n=retries) : nothing # see Base.ExponentialBackOff
     retry_check = nothing # see Base.retry `check` keyword argument
     on_fail_policy::Union{Tuple{Symbol, Int}, Nothing} = nothing # :ignore, :disable, :unschedule + max consecutive failures for disable/unschedule
+    max_executions::Union{Int, Nothing} = nothing # max number of executions job is allowed to run
+    expires_at::Union{DateTime, Nothing} = nothing # expiration time for job
 end
 
 """
@@ -53,16 +57,15 @@ Represents a scheduled job in the Tempus scheduler.
 - `disabledAt::Union{DateTime, Nothing}`: Timestamp when the job was disabled (if applicable).
 """
 mutable struct Job
+    const action::Function
     const name::String
     const schedule::Cron
-    const action::Function
     const options::JobOptions
     # fields managed by scheduler
     disabledAt::Union{DateTime, Nothing}
 end
 
-Job(name, schedule, action::Function; kw...) = Job(string(name), schedule isa Cron ? schedule : parseCron(schedule), action, JobOptions(kw...), nothing)
-Job(action::Function, name, schedule; kw...) = Job(name, schedule, action; kw...)
+Job(action::Function, name, schedule; kw...) = Job(action, string(name), schedule isa Cron ? schedule : parseCron(schedule), JobOptions(kw...), nothing)
 
 """
     disable!(job::Job)
@@ -325,6 +328,25 @@ function checkDisable!(scheduler::Scheduler, store::Store, job::Job, on_fail_pol
     return
 end
 
+function checkExpirationAndMaxExecutions!(scheduler::Scheduler, job::Job)
+    max_executions = _some(job.options.max_executions, scheduler.jobOptions.max_executions)
+    expires_at = _some(job.options.expires_at, scheduler.jobOptions.expires_at)
+    if max_executions !== nothing
+        execs = getNMostRecentJobExecutions(scheduler.store, job.name, max_executions)
+        if length(execs) >= max_executions
+            unschedule!(scheduler, job)
+            @info "Unscheduling job $(job.name) after reaching maximum executions of $(max_executions)."
+            return true
+        end
+    end
+    if expires_at !== nothing && expires_at < Dates.now(UTC)
+        unschedule!(scheduler, job)
+        @info "Unscheduling job $(job.name) after expiration at $(expires_at)."
+        return true
+    end
+    return false
+end
+
 """
     run!(scheduler::Scheduler)
 
@@ -371,8 +393,10 @@ function run!(scheduler::Scheduler)
                                 @warn "Job $(je.job.name) already executing, keeping scheduled execution queued until current execution finishes. There are $nexecs queued for this job."
                                 # check if we need to schedule the next execution
                                 next = getnext(je.job.schedule)
-                                if any(j -> j.job.name == je.job.name && j.scheduledStart == next, scheduler.jobExecutions)
-                                    # we've already scheduled this execution, skip
+                                # check job expiration and max executions
+                                unscheduled = checkExpirationAndMaxExecutions!(scheduler, je.job)
+                                if unscheduled || any(j -> j.job.name == je.job.name && j.scheduledStart == next, scheduler.jobExecutions)
+                                    # job is unscheduled or we've already scheduled this execution, skip
                                 else
                                     push!(scheduler.jobExecutions, JobExecution(je.job, next))
                                 end
@@ -390,6 +414,8 @@ function run!(scheduler::Scheduler)
                     for (i, toSkip, je) in readyToExecute
                         deleteat!(scheduler.jobExecutions, i)
                         next = getnext(je.job.schedule)
+                        # check job expiration and max executions
+                        checkExpirationAndMaxExecutions!(scheduler, je.job) && continue
                         newje = JobExecution(je.job, next)
                         push!(scheduler.jobExecutions, newje)
                         if je.job.disabledAt !== nothing
@@ -466,17 +492,22 @@ function executeJob!(scheduler::Scheduler, jobExecution::JobExecution)
     return
 end
 
-currentlyExecutionJobs(sch::Scheduler) = [je.jobExecutionId for je in sch.executingJobExecutions]
-
 """
     close(scheduler::Scheduler)
 
 Closes the scheduler, stopping job execution; waits for any currently executing jobs to finish.
+Will wait `timeout` seconds (5 by default) for any currently executing jobs to finish before returning.
 """
-function Base.close(scheduler::Scheduler)
-    @info "Closing scheduler and stopping job execution."
+function Base.close(scheduler::Scheduler; timeout::Real=5)
+    @info "Closing scheduler and waiting $(timeout)s for job executions to stop."
     @lock scheduler.lock begin
         scheduler.running = false
+    end
+    # we use a Timer here to notify jobExecutionFinished ourself if the scheduler
+    # or last executing job doesn't do it themselves in time
+    Timer(timeout) do t
+        @warn "Scheduler closing timeout reached, returning without waiting for job executions to finish."
+        notify(scheduler.jobExecutionFinished)
     end
     wait(scheduler.jobExecutionFinished)
     @info "Scheduler closed and job execution stopped."
