@@ -3,6 +3,7 @@
 [![Build Status](https://github.com/JuliaServices/Tempus.jl/actions/workflows/ci.yml/badge.svg)](https://github.com/JuliaServices/Tempus.jl/actions)
 [![Coverage](https://codecov.io/gh/JuliaServices/Tempus.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/JuliaServices/Tempus.jl)
 [![Documentation](https://img.shields.io/badge/docs-stable-blue.svg)](https://JuliaServices.github.io/Tempus.jl/stable/)
+[![Dev Documentation](https://img.shields.io/badge/docs-dev-blue.svg)](https://JuliaServices.github.io/Tempus.jl/dev/)
 
 ## Overview
 **Tempus.jl** is a lightweight, Quartz-inspired job scheduling library for Julia. It provides an easy-to-use API for defining cron-like schedules and executing jobs at specified times.
@@ -16,11 +17,11 @@
 - Supports retry policies with exponential backoff
 
 ## Installation
-Tempus.jl is not yet registered in the Julia General registry. You can install it directly from GitHub:
+Tempus.jl is registered in the Julia General registry. You can install it directly from GitHub:
 
 ```julia
 using Pkg
-Pkg.add(url="https://github.com/JuliaServices/Tempus.jl")
+Pkg.add("Tempus")
 ```
 
 ## Quick Start
