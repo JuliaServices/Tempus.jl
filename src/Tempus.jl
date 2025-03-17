@@ -1,3 +1,14 @@
+"""
+Tempus provides a cron-style job scheduling framework for Julia, inspired by Quartz in Java. 
+
+## Features:
+- Define jobs with cron-like scheduling expressions
+- Supports job execution policies (overlap handling, retries, and failure strategies)
+- Multiple job stores and JobStore interface (in-memory, file-based persistence)
+- Concurrency-aware execution with configurable retry logic
+- Supports disabling, enabling, and unscheduling jobs dynamically
+- Thread-safe scheduling with a background execution loop
+"""
 module Tempus
 
 using Dates, Logging, Serialization
@@ -9,6 +20,18 @@ include("cron.jl")
 _some(x, y...) = x === nothing ? _some(y...) : x
 _some(x) = x
 
+"""
+    JobOptions
+
+Defines options for job execution behavior.
+
+# Fields:
+- `overlap_policy::Union{Symbol, Nothing}`: Determines job execution behavior when the same job is already running (`:skip`, `:queue`, `:concurrent`).
+- `retries::Int`: Number of retries allowed on failure.
+- `retry_delays::Union{Base.ExponentialBackOff, Nothing}`: Delay strategy for retries (defaults to exponential backoff if `retries > 0`).
+- `retry_check`: Custom function to determine retry behavior (`check` argument from `Base.retry`).
+- `on_fail_policy::Union{Tuple{Symbol, Int}, Nothing}`: Determines job failure handling (`:ignore`, `:disable`, `:unschedule`), with a threshold for consecutive failures.
+"""
 @kwdef struct JobOptions
     overlap_policy::Union{Symbol, Nothing} = nothing # :skip, :queue, :concurrent
     retries::Int = 0
@@ -17,6 +40,18 @@ _some(x) = x
     on_fail_policy::Union{Tuple{Symbol, Int}, Nothing} = nothing # :ignore, :disable, :unschedule + max consecutive failures for disable/unschedule
 end
 
+"""
+    Job
+
+Represents a scheduled job in the Tempus scheduler.
+
+# Fields:
+- `name::String`: Unique identifier for the job.
+- `schedule::Cron`: The cron-style schedule expression.
+- `action::Function`: The function to execute when the job runs.
+- `options::JobOptions`: Execution options for retries, failures, and overlap handling.
+- `disabledAt::Union{DateTime, Nothing}`: Timestamp when the job was disabled (if applicable).
+"""
 mutable struct Job
     const name::String
     const schedule::Cron
@@ -28,12 +63,44 @@ end
 
 Job(name, schedule, action::Function; kw...) = Job(string(name), schedule isa Cron ? schedule : parseCron(schedule), action, JobOptions(kw...), nothing)
 Job(action::Function, name, schedule; kw...) = Job(name, schedule, action; kw...)
+
+"""
+    disable!(job::Job)
+
+Disables a job, preventing it from being scheduled for execution.
+"""
 disable!(job::Job) = (job.disabledAt = Dates.now(UTC))
+
+"""
+    enable!(job::Job)
+
+Enables a previously disabled job, allowing it to be scheduled again.
+"""
 enable!(job::Job) = (job.disabledAt = nothing)
+
+"""
+    isdisabled(job::Job) -> Bool
+
+Returns `true` if the job is currently disabled.
+"""
 isdisabled(job::Job) = job.disabledAt !== nothing
 
 Base.hash(j::Job, h::UInt) = hash(j.name, h)
 
+"""
+    JobExecution
+
+Represents an instance of a job execution.
+
+# Fields:
+- `jobExecutionId::String`: Unique identifier for this job execution.
+- `job::Job`: The job being executed.
+- `scheduledStart::DateTime`: When the job was scheduled to run.
+- `runConcurrently::Bool`: Whether this execution is running concurrently with another.
+- `actualStart::DateTime`: The actual start time.
+- `finish::DateTime`: The completion time.
+- `status::Symbol`: The execution result (`:succeeded`, `:failed`).
+"""
 mutable struct JobExecution
     const jobExecutionId::String
     const job::Job
@@ -47,13 +114,33 @@ end
 
 Base.hash(je::JobExecution, h::UInt) = hash(je.jobExecutionId, h)
 
+"""
+    Store
+
+Defines an interface for job storage backends.
+"""
 abstract type Store end
 
-"Get all persisted jobs from `store`"
+"""
+    getJobs(store::Store) -> Collection{Job}
+
+Retrieve all jobs stored in `store`, regardless of disabled status.
+"""
 function getJobs end
-"Persist `job` in `store`"
+
+"""
+    addJob!(store::Store, job::Job)
+
+Add a new `job` to `store`.
+"""
 function addJob! end
-"Remove `job` from `store`; does *not* remove job execution history from store"
+
+"""
+    removeJob!(store::Store, job::Union{Job, String})
+
+Remove a `job` from `store` by reference or name.
+Store implementations may choose to remove job execution history as well.
+"""
 function removeJob! end
 
 # fallback for removing job by name
@@ -65,6 +152,11 @@ function removeJob!(store::Store, jobName::String)
     return
 end
 
+"""
+    disableJob!(store::Store, job::Union{Job, String})
+    
+Disable a `job` in `store` by reference or name.
+"""
 function disableJob!(store::Store, job::Union{Job, String})
     jobName = job isa Job ? job.name : job
     jobs = getJobs(store)
@@ -74,13 +166,36 @@ function disableJob!(store::Store, job::Union{Job, String})
     return
 end
 
-"Store `jobExecution` in `store`"
-function storeJobExecution! end
-"Get the `n` most recent job executions persisted in `store`"
-function getNMostRecentJobExecutions end
-"Completely remove all job execution history by job name (String)"
+"""
+    storeJobExecution!(store::Store, jobExecution::JobExecution)
+
+Store `jobExecution` in `store`.
+"""
+function storeJobExecution!(store::Store, jobExecution::JobExecution) end
+
+"""
+    getNMostRecentJobExecutions(store::Store, jobName::String, n::Int) -> Vector{JobExecution}
+
+Get the `n` most recent job executions for a job persisted in `store`.
+"""
+function getNMostRecentJobExecutions(store::Store, jobName::String, n::Int) end
+
+"""
+    removeJobExecutions!(store::Store, jobName::String)
+
+Remove all job execution history for `jobName` from `store`.
+"""
 function removeJobExecutions! end
 
+"""
+    InMemoryStore <: Store
+
+An in-memory job storage backend.
+
+# Fields:
+- `jobs::Set{Job}`: Stores active jobs.
+- `jobExecutions::Dict{String, Vector{JobExecution}}`: Stores execution history for each job.
+"""
 struct InMemoryStore <: Store
     jobs::Set{Job}
     jobExecutions::Dict{String, Vector{JobExecution}} # job executions stored most recent first
@@ -107,6 +222,15 @@ function removeJobExecutions!(store::InMemoryStore, jobName::String)
     return
 end
 
+"""
+    FileStore <: Store
+
+A file-based job storage backend that persists jobs and execution history to disk.
+
+# Fields:
+- `filepath::String`: The file path where jobs are serialized.
+- `store::InMemoryStore`: In-memory store that handles operations before syncing to disk.
+"""
 struct FileStore <: Store
     filepath::String
     store::InMemoryStore
@@ -130,6 +254,20 @@ end
 
 removeJobExecutions!(store::FileStore, jobName::String) = removeJobExecutions!(store.store, jobName)
 
+"""
+    Scheduler
+
+The main scheduling engine that executes jobs according to their schedules.
+
+# Fields:
+- `lock::ReentrantLock`: Ensures thread-safe access.
+- `jobExecutions::Vector{JobExecution}`: List of scheduled job executions.
+- `store::Store`: Job storage backend.
+- `jobExecutionFinished::Threads.Event`: Signals all job executions have finished when shutting down.
+- `executingJobExecutions::Set{JobExecution}`: Tracks currently executing jobs.
+- `running::Bool`: Scheduler state (running/stopped).
+- `jobOptions::JobOptions`: Default job execution options.
+"""
 mutable struct Scheduler
     const lock::ReentrantLock
     const jobExecutions::Vector{JobExecution}
@@ -148,6 +286,12 @@ mutable struct Scheduler
     ) = new(ReentrantLock(), JobExecution[], store, Threads.Event(), Set{JobExecution}(), false, JobOptions(; overlap_policy, retries, retry_delays, retry_check, on_fail_policy))
 end
 
+"""
+    removeJob!(scheduler::Scheduler, job::Union{Job, String})
+
+Removes a job from the scheduler, preventing it from being executed in the future.
+This function does *not* remove the job from the scheduler's Store.
+"""
 function removeJob!(scheduler::Scheduler, job::Union{Job, String})
     jobName = job isa Job ? job.name : job
     @lock scheduler.lock begin
@@ -159,6 +303,7 @@ function removeJob!(scheduler::Scheduler, job::Union{Job, String})
     return
 end
 
+# check if job should be disabled based on on_fail_policy and job execution history
 function checkDisable!(scheduler::Scheduler, store::Store, job::Job, on_fail_policy::Union{Tuple{Symbol, Int}, Nothing})
     (on_fail_policy === nothing || on_fail_policy[1] === :ignore) && return
     execs = getNMostRecentJobExecutions(store, job.name, on_fail_policy === nothing ? 0 : on_fail_policy[2])
@@ -180,6 +325,11 @@ function checkDisable!(scheduler::Scheduler, store::Store, job::Job, on_fail_pol
     return
 end
 
+"""
+    run!(scheduler::Scheduler)
+
+Starts the scheduler, executing jobs at their scheduled times.
+"""
 function run!(scheduler::Scheduler)
     @info "Starting scheduler and all jobs."
     reset(scheduler.jobExecutionFinished)
@@ -231,6 +381,8 @@ function run!(scheduler::Scheduler)
                             push!(readyToExecute, (i, false, je))
                             push!(scheduler.executingJobExecutions, je)
                         end
+                    else
+                        break
                     end
                 end
                 # remove job executions that are ready or to be skipped while holding the lock and schedule next execution
@@ -255,19 +407,21 @@ function run!(scheduler::Scheduler)
             if !isempty(readyToExecute)
                 for (_, _, je) in readyToExecute
                     # we're ready to execute a job!
-                    run!(scheduler, je)
+                    executeJob!(scheduler, je)
                 end
             else
                 @info "No jobs to execute, sleeping 500ms then checking again."
                 sleep(0.5)
             end
         end
-        notify(scheduler.jobExecutionFinished)
+        @lock scheduler.lock begin
+            isempty(scheduler.executingJobExecutions) && notify(scheduler.jobExecutionFinished)
+        end
     end)
     return scheduler
 end
 
-function run!(scheduler::Scheduler, jobExecution::JobExecution)
+function executeJob!(scheduler::Scheduler, jobExecution::JobExecution)
     errormonitor(Threads.@spawn begin
         now = Dates.now(UTC)
         if jobExecution.runConcurrently
@@ -306,6 +460,7 @@ function run!(scheduler::Scheduler, jobExecution::JobExecution)
         end
         @lock scheduler.lock begin
             delete!(scheduler.executingJobExecutions, jobExecution)
+            !scheduler.running && isempty(scheduler.executingJobExecutions) && notify(scheduler.jobExecutionFinished)
         end
     end)
     return
@@ -313,22 +468,26 @@ end
 
 currentlyExecutionJobs(sch::Scheduler) = [je.jobExecutionId for je in sch.executingJobExecutions]
 
+"""
+    close(scheduler::Scheduler)
+
+Closes the scheduler, stopping job execution; waits for any currently executing jobs to finish.
+"""
 function Base.close(scheduler::Scheduler)
     @info "Closing scheduler and stopping job execution."
-    # check for any executing jobs
-    while true
-        @lock scheduler.lock begin
-            scheduler.running = false
-            isempty(scheduler.executingJobExecutions) && break
-        end
-        @debug "Waiting for executing jobs to finish."
-        sleep(0.5)
+    @lock scheduler.lock begin
+        scheduler.running = false
     end
     wait(scheduler.jobExecutionFinished)
     @info "Scheduler closed and job execution stopped."
     return
 end
 
+"""
+    push!(scheduler::Scheduler, job::Job)
+
+Adds a job to the scheduler and underlying Store, scheduling its next execution based on its cron schedule.
+"""
 function Base.push!(scheduler::Scheduler, job::Job)
     @lock scheduler.lock begin
         addJob!(scheduler.store, job)
@@ -341,6 +500,13 @@ function Base.push!(scheduler::Scheduler, job::Job)
     return job
 end
 
+"""
+    unschedule!(scheduler::Scheduler, job::Union{Job, String})
+
+Removes a job from the scheduler and underlying Store, preventing it from being executed
+in the future. Any currently scheduled executions of this job will 
+also be removed from the scheduler. Note it is Store-dependent whether job execution history is removed.
+"""
 function unschedule!(scheduler::Scheduler, job::Union{Job, String})
     jobName = job isa Job ? job.name : job
     @info "Removing job $(jobName) from scheduler."
@@ -351,6 +517,11 @@ function unschedule!(scheduler::Scheduler, job::Union{Job, String})
     return job
 end
 
+"""
+    withscheduler(f, args...; kw...)
+
+Creates a scheduler, runs a function `f` with it, then calls `close`.
+"""
 function withscheduler(f, args...; kw...)
     scheduler = Scheduler(args...; kw...)
     try
