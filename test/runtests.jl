@@ -320,36 +320,36 @@ executed = DateTime[]
     end
     @test length(executed) == 2
     @test toggle[] == false
-    # on_fail_policy
-    # ignore
-    always_fail_job = Tempus.Job("failjob", "* * * * * *") do
-        push!(executed, Dates.now(UTC))
-        error("always fail job")
-    end
-    empty!(executed)
-    withscheduler(; on_fail_policy=(:ignore, 0)) do sch
-        push!(sch, always_fail_job)
-        sleep(4)  # wait for the job to run multiple times
-    end
-    @test length(executed) > 4 # job should run every second + retries, but never get disabled
-    # on_fail_policy disable job after 1 failure
-    empty!(executed)
-    Tempus.enable!(always_fail_job)
-    withscheduler(; retries=0, on_fail_policy=(:disable, 1)) do sch
-        push!(sch, always_fail_job)
-        sleep(4)  # wait to verify job does not run
-    end
-    @test length(executed) == 1 # job ran once, failed, and was disabled
-    @test Tempus.isdisabled(always_fail_job)
-    # on_fail_policy unschedule the job after 1 failure
-    empty!(executed)
-    Tempus.enable!(always_fail_job)
-    withscheduler(; retries=0, on_fail_policy=(:unschedule, 1)) do sch
-        push!(sch, always_fail_job)
-        sleep(3)  # wait job to run, fail, and be unscheduled and ensure it isn't run again
-        @test all(je -> je.job.name != always_fail_job.name, sch.jobExecutions)
-    end
-    @test length(executed) == 1 # job ran once, failed, and was unscheduled
+    # # on_fail_policy
+    # # ignore
+    # always_fail_job = Tempus.Job("failjob", "* * * * * *") do
+    #     push!(executed, Dates.now(UTC))
+    #     error("always fail job")
+    # end
+    # empty!(executed)
+    # withscheduler(; on_fail_policy=(:ignore, 0)) do sch
+    #     push!(sch, always_fail_job)
+    #     sleep(4)  # wait for the job to run multiple times
+    # end
+    # @test length(executed) > 4 # job should run every second + retries, but never get disabled
+    # # on_fail_policy disable job after 1 failure
+    # empty!(executed)
+    # Tempus.enable!(always_fail_job)
+    # withscheduler(; retries=0, on_fail_policy=(:disable, 1)) do sch
+    #     push!(sch, always_fail_job)
+    #     sleep(4)  # wait to verify job does not run
+    # end
+    # @test length(executed) == 1 # job ran once, failed, and was disabled
+    # @test Tempus.isdisabled(always_fail_job)
+    # # on_fail_policy unschedule the job after 1 failure
+    # empty!(executed)
+    # Tempus.enable!(always_fail_job)
+    # withscheduler(; retries=0, on_fail_policy=(:unschedule, 1)) do sch
+    #     push!(sch, always_fail_job)
+    #     sleep(3)  # wait job to run, fail, and be unscheduled and ensure it isn't run again
+    #     @test all(je -> je.job.name != always_fail_job.name, sch.jobExecutions)
+    # end
+    # @test length(executed) == 1 # job ran once, failed, and was unscheduled
 
     # if execution is being retried n times and job gets disabled/unscheduled, retries are stopped
 

@@ -194,6 +194,8 @@ function parseCron(cron::String)
     return Cron(second, minute, hour, day, month, day_of_week)
 end
 
+const ANY_CRON = Cron(Wildcard(), Wildcard(), Wildcard(), Wildcard(), Wildcard(), Wildcard())
+
 # Compute the next trigger time after 'from'
 function getnext(cron::Cron, from::DateTime=Dates.now(UTC))
     minSeconds = minimumallowed(Second, cron.second)
