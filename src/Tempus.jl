@@ -234,9 +234,12 @@ function getNMostRecentJobExecutions(store::Store, jobName::String, n::Int) end
 # fallback for purging job by name
 function purgeJob!(store::Store, jobName::String)
     jobs = getJobs(store)
-    job = findfirst(j -> j.name == jobName, jobs)
-    job === nothing && return
-    purgeJob!(store, job)
+    for job in jobs
+        if job.name == jobName
+            purgeJob!(store, job)
+            return
+        end
+    end
     return
 end
 
@@ -248,9 +251,12 @@ Disable a `job` in `store` by reference or name.
 function disableJob!(store::Store, job::Union{Job, String})
     jobName = job isa Job ? job.name : job
     jobs = getJobs(store)
-    job = findfirst(j -> j.name == jobName, jobs)
-    job === nothing && return
-    disable!(job)
+    for j in jobs
+        if j.name == jobName
+            disable!(j)
+            return
+        end
+    end
     return
 end
 
@@ -272,13 +278,16 @@ end
 InMemoryStore() = InMemoryStore(ReentrantLock(), Set{Job}(), Dict{String, Vector{JobExecution}}())
 
 addJob!(store::InMemoryStore, job::Job) = @lock store.lock push!(store.jobs, job)
+
 function purgeJob!(store::InMemoryStore, job::Job)
     @lock store.lock begin
         delete!(store.jobs, job)
         delete!(store.jobExecutions, job.name)
     end
 end
+
 getJobs(store::InMemoryStore) = store.jobs
+
 function getNMostRecentJobExecutions(store::InMemoryStore, jobName::String, n::Int)
     n == 0 && return JobExecution[]
     execs = @lock store.lock get(() -> JobExecution[], store.jobExecutions, jobName)
@@ -477,7 +486,7 @@ function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
                     executeJob!(scheduler, je)
                 end
             else
-                @info "No jobs to execute, sleeping 500ms then checking again."
+                # @info "No jobs to execute, sleeping 500ms then checking again."
                 sleep(0.5)
             end
         end
