@@ -313,7 +313,7 @@ executed = DateTime[]
     @test length(executed) == 1
     # concurrent
     empty!(executed)
-    withscheduler(; overlap_policy=:concurrent) do sch
+    withscheduler(; overlap_policy=:concurrent, max_concurrent_executions=2) do sch
         push!(sch, sleep_job)
         sleep(2.5)  # wait for the job to run once
     end
