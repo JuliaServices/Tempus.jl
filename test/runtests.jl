@@ -215,7 +215,46 @@ end
         @test next == DateTime(2021, 2, 1, 0, 0, 0)
     end
 
-    # 10. Edge-case: Leap year.
+    # 10. List minute expression: "0,30 * * * *" (at minutes 0 and 30)
+    @testset "List minute: 0,30" begin
+        cron = parseCron("0,30 * * * *")
+        @test cron.minute isa Tempus.List
+        @test cron.minute.values == [0, 30]
+
+        # Before minute 30 — should advance to minute 30 in the same hour
+        dt = DateTime(2021, 1, 1, 0, 10, 0)
+        next = getnext(cron, dt)
+        @test next == DateTime(2021, 1, 1, 0, 30, 0)
+
+        # At minute 30 — should advance to minute 0 of the next hour
+        dt = DateTime(2021, 1, 1, 0, 30, 0)
+        next = getnext(cron, dt)
+        @test next == DateTime(2021, 1, 1, 1, 0, 0)
+
+        # After minute 30 — should advance to minute 0 of the next hour
+        dt = DateTime(2021, 1, 1, 0, 45, 0)
+        next = getnext(cron, dt)
+        @test next == DateTime(2021, 1, 1, 1, 0, 0)
+
+        # At minute 0 — should advance to minute 30 of the same hour
+        dt = DateTime(2021, 1, 1, 1, 0, 0)
+        next = getnext(cron, dt)
+        @test next == DateTime(2021, 1, 1, 1, 30, 0)
+    end
+
+    # 11. List with more values: "0,15,30,45 * * * *" (every 15 min via list)
+    @testset "List minute: 0,15,30,45" begin
+        cron = parseCron("0,15,30,45 * * * *")
+        dt = DateTime(2021, 1, 1, 0, 7, 0)
+        next = getnext(cron, dt)
+        @test next == DateTime(2021, 1, 1, 0, 15, 0)
+
+        dt = DateTime(2021, 1, 1, 0, 46, 0)
+        next = getnext(cron, dt)
+        @test next == DateTime(2021, 1, 1, 1, 0, 0)
+    end
+
+    # 12. Edge-case: Leap year.
     @testset "Leap year" begin
         cron = parseCron("* * * * *")
         dt = DateTime(2020, 2, 28, 23, 59, 59)

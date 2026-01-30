@@ -71,7 +71,7 @@ end
 
 Base.show(io::IO, x::List) = print(io, join(x.values, ","))
 
-allowed(p::P, x::List) where {P <: Period} = any(==(P(p)), x.values)
+allowed(p::P, x::List) where {P <: Period} = Dates.value(p) in x.values
 function nextallowed(p::P, x::List) where {P <: Period}
     for v in x.values
         P(v) > p && return P(v)
