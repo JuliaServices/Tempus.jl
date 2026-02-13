@@ -75,8 +75,8 @@ mutable struct Job
     disabledAt::Union{DateTime, Nothing}
 end
 
-Job(action::Function, name, schedule; kw...) = Job(ReentrantLock(), action, string(name), schedule isa Cron ? schedule : parseCron(schedule), JobOptions(kw...), nothing)
-OneShotJob(action::Function, name; kw...) = Job(ReentrantLock(), action, string(name), nothing, JobOptions(max_executions=1, kw...), nothing)
+Job(action::Function, name, schedule; kw...) = Job(ReentrantLock(), action, string(name), schedule isa Cron ? schedule : parseCron(schedule), JobOptions(; kw...), nothing)
+OneShotJob(action::Function, name; kw...) = Job(ReentrantLock(), action, string(name), nothing, JobOptions(; max_executions=1, kw...), nothing)
 
 function Base.show(io::IO, job::Job)
     println(io, "Job: $(job.name)")
@@ -92,17 +92,18 @@ nextJobExecution(scheduler, job::Job) =
         job,
         _some(job.options.max_failed_executions, scheduler.jobOptions.max_failed_executions),
         _some(job.options.max_executions, scheduler.jobOptions.max_executions),
-        _some(job.options.expires_at, scheduler.jobOptions.expires_at)
+        _some(job.options.expires_at, scheduler.jobOptions.expires_at);
+        logging=scheduler.logging
     )
 
 # for a given `job`` persisted in `store`, check status of job and return the next DateTime when it should be executed
 # `nothing` is returned if the job shouldn't be scheduled again
-function nextJobExecution(store::Store, job::Job, max_failed_executions=job.options.max_failed_executions, max_executions=job.options.max_executions, expires_at=job.options.expires_at)
+function nextJobExecution(store::Store, job::Job, max_failed_executions=job.options.max_failed_executions, max_executions=job.options.max_executions, expires_at=job.options.expires_at; logging::Bool=true)
     # if job is already disabled, return nothing
     isdisabled(job) && return nothing
     # check if job has expired
     if expires_at !== nothing && expires_at < Dates.now(UTC)
-        @info "Disabling job $(job.name) due to expiration: $(expires_at)."
+        logging && @info "Disabling job $(job.name) due to expiration: $(expires_at)."
         disable!(job)
         return nothing
     end
@@ -111,7 +112,7 @@ function nextJobExecution(store::Store, job::Job, max_failed_executions=job.opti
     execs = getNMostRecentJobExecutions(store, job.name, nexecs)
     # check if max number of executions has been reached
     if max_executions !== nothing && count(e -> e.status == :succeeded, execs) >= max_executions
-        @info "Disabling job $(job.name) after reaching maximum number of successful executions: $(max_executions)."
+        logging && @info "Disabling job $(job.name) after reaching maximum number of successful executions: $(max_executions)."
         disable!(job)
         return nothing
     end
@@ -120,7 +121,7 @@ function nextJobExecution(store::Store, job::Job, max_failed_executions=job.opti
         execs = execs[1:max_failed_executions]
     end
     if max_failed_executions !== nothing && count(e -> e.status == :failed, execs) >= max_failed_executions
-        @info "Disabling job $(job.name) after reaching maximum number of failed executions: $(max_failed_executions)."
+        logging && @info "Disabling job $(job.name) after reaching maximum number of failed executions: $(max_failed_executions)."
         disable!(job)
         return nothing
     end
@@ -361,6 +362,7 @@ The main scheduling engine that executes jobs according to their schedules.
 - `running::Bool`: Scheduler state (running/stopped).
 - `jobOptions::JobOptions`: Default job execution options.
 - `max_concurrent_executions::Int`: Limit on how many total executions can be running concurrently for this scheduler, defaults to `Threads.nthreads()`
+- `logging::Bool`: Whether to emit log messages during scheduler operations, defaults to `true`.
 """
 mutable struct Scheduler
     const lock::ReentrantLock
@@ -371,6 +373,7 @@ mutable struct Scheduler
     running::Bool
     const jobOptions::JobOptions
     const max_concurrent_executions::Int
+    const logging::Bool
     Scheduler(
         store::Store=InMemoryStore();
         overlap_policy::Symbol=:skip,
@@ -381,7 +384,8 @@ mutable struct Scheduler
         max_executions::Union{Int, Nothing}=nothing,
         expires_at::Union{DateTime, Nothing}=nothing,
         max_concurrent_executions::Int=Threads.nthreads(),
-    ) = new(ReentrantLock(), JobExecution[], store, Threads.Event(), Set{JobExecution}(), false, JobOptions(; overlap_policy, retries, retry_delays, retry_check, max_failed_executions, max_executions, expires_at), max_concurrent_executions)
+        logging::Bool=true,
+    ) = new(ReentrantLock(), JobExecution[], store, Threads.Event(), Set{JobExecution}(), false, JobOptions(; overlap_policy, retries, retry_delays, retry_check, max_failed_executions, max_executions, expires_at), max_concurrent_executions, logging)
 end
 
 function Base.show(io::IO, scheduler::Scheduler)
@@ -397,7 +401,7 @@ end
 Starts the scheduler, executing jobs at their scheduled times.
 """
 function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
-    @info "Starting scheduler and all jobs."
+    scheduler.logging && @info "Starting scheduler and all jobs."
     reset(scheduler.jobExecutionFinished)
     jobs = getJobs(scheduler.store)
     # generate initial JobExecution list
@@ -423,7 +427,7 @@ function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
             @lock scheduler.lock begin
                 scheduler.running || break
                 if isempty(scheduler.jobExecutions) && close_when_no_jobs
-                    @info "No jobs left to execute, closing scheduler."
+                    scheduler.logging && @info "No jobs left to execute, closing scheduler."
                     break
                 end
                 # check for jobs that are ready to execute
@@ -446,7 +450,7 @@ function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
                                 je.runConcurrently = true
                             elseif _some(je.job.options.overlap_policy, scheduler.jobOptions.overlap_policy) == :queue
                                 nexecs = count(j -> j.job.name == je.job.name, scheduler.jobExecutions)
-                                @warn "Job $(je.job.name) already executing, keeping scheduled execution queued until current execution finishes. There are $nexecs queued for this job."
+                                scheduler.logging && @warn "Job $(je.job.name) already executing, keeping scheduled execution queued until current execution finishes. There are $nexecs queued for this job."
                                 next = nextJobExecution(scheduler, je.job)
                                 if next !== nothing && !any(j -> j.job.name == je.job.name && j.scheduledStart == next, scheduler.jobExecutions)
                                     push!(scheduler.jobExecutions, next)
@@ -468,12 +472,14 @@ function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
                         if next !== nothing && !any(j -> j.job.name == je.job.name && j.scheduledStart == next, scheduler.jobExecutions)
                             push!(scheduler.jobExecutions, next)
                         end
-                        if isdisabled(je.job) !== nothing
-                            @info "[$(je.jobExecutionId)]: Skipping disabled job $(je.job.name) (disabled at $(je.job.disabledAt)) execution at $(now), next scheduled at $(next.scheduledStart)"
-                        elseif toSkip
-                            @info "[$(je.jobExecutionId)]: Skipping job $(je.job.name) execution at $(now), next scheduled at $(next.scheduledStart)"
-                        else
-                            @info "[$(je.jobExecutionId)]: Job $(je.job.name) execution scheduled at $(next.scheduledStart)"
+                        if scheduler.logging
+                            if isdisabled(je.job) !== nothing
+                                @info "[$(je.jobExecutionId)]: Skipping disabled job $(je.job.name) (disabled at $(je.job.disabledAt)) execution at $(now), next scheduled at $(next.scheduledStart)"
+                            elseif toSkip
+                                @info "[$(je.jobExecutionId)]: Skipping job $(je.job.name) execution at $(now), next scheduled at $(next.scheduledStart)"
+                            else
+                                @info "[$(je.jobExecutionId)]: Job $(je.job.name) execution scheduled at $(next.scheduledStart)"
+                            end
                         end
                     end
                     sort!(scheduler.jobExecutions, by=je->je.scheduledStart)
@@ -500,20 +506,22 @@ end
 function executeJob!(scheduler::Scheduler, jobExecution::JobExecution)
     errormonitor(Threads.@spawn begin
         now = Dates.now(UTC)
-        if jobExecution.runConcurrently
-            @info "[$(jobExecution.jobExecutionId)]: Executing job $(jobExecution.job.name) concurrently at $(now)"
-        else
-            @info "[$(jobExecution.jobExecutionId)]: Executing job $(jobExecution.job.name) at $(now)"
+        if scheduler.logging
+            if jobExecution.runConcurrently
+                @info "[$(jobExecution.jobExecutionId)]: Executing job $(jobExecution.job.name) concurrently at $(now)"
+            else
+                @info "[$(jobExecution.jobExecutionId)]: Executing job $(jobExecution.job.name) at $(now)"
+            end
         end
         retry_check = _some(jobExecution.job.options.retry_check, scheduler.jobOptions.retry_check)
         check = (eb, e) -> begin
             if isdisabled(jobExecution.job)
-                @info "[$(jobExecution.jobExecutionId)]: Skipping job $(jobExecution.job.name) retry due to job being disabled"
+                scheduler.logging && @info "[$(jobExecution.jobExecutionId)]: Skipping job $(jobExecution.job.name) retry due to job being disabled"
                 return false
             end
             should_retry = retry_check !== nothing ? retry_check(eb, e) : true
             if should_retry
-                @info "[$(jobExecution.jobExecutionId)]: Job $(jobExecution.job.name) execution failed, retrying"
+                scheduler.logging && @info "[$(jobExecution.jobExecutionId)]: Job $(jobExecution.job.name) execution failed, retrying"
             end
             return should_retry
         end
@@ -528,10 +536,10 @@ function executeJob!(scheduler::Scheduler, jobExecution::JobExecution)
         catch e
             jobExecution.exception = e
             jobExecution.status = :failed
-            @error "[$(jobExecution.jobExecutionId)]: Job $(jobExecution.job.name) execution failed" exception=(e, catch_backtrace())
+            scheduler.logging && @error "[$(jobExecution.jobExecutionId)]: Job $(jobExecution.job.name) execution failed" exception=(e, catch_backtrace())
         finally
             jobExecution.finish = Dates.now(UTC)
-            @info "[$(jobExecution.jobExecutionId)]: Job $(jobExecution.job.name) execution finished at $(jobExecution.finish)"
+            scheduler.logging && @info "[$(jobExecution.jobExecutionId)]: Job $(jobExecution.job.name) execution finished at $(jobExecution.finish)"
         end
         # store the job execution
         storeJobExecution!(scheduler.store, jobExecution)
@@ -555,7 +563,7 @@ Closes the scheduler, stopping job execution; waits for any currently executing 
 Will wait `timeout` seconds (5 by default) for any currently executing jobs to finish before returning.
 """
 function Base.close(scheduler::Scheduler; timeout::Real=5)
-    @info "Closing scheduler and waiting $(timeout)s for job executions to stop."
+    scheduler.logging && @info "Closing scheduler and waiting $(timeout)s for job executions to stop."
     @lock scheduler.lock begin
         scheduler.running = false
     end
@@ -563,12 +571,12 @@ function Base.close(scheduler::Scheduler; timeout::Real=5)
     # or last executing job doesn't do it themselves in time
     Timer(timeout) do t
         if isopen(t)
-            @warn "Scheduler closing timeout reached, returning without waiting for job executions to finish."
+            scheduler.logging && @warn "Scheduler closing timeout reached, returning without waiting for job executions to finish."
             notify(scheduler.jobExecutionFinished)
         end
     end
     wait(scheduler.jobExecutionFinished)
-    @info "Scheduler closed and job execution stopped."
+    scheduler.logging && @info "Scheduler closed and job execution stopped."
     return
 end
 
@@ -594,7 +602,7 @@ function Base.push!(scheduler::Scheduler, job::Job)
             return job
         end
         push!(scheduler.jobExecutions, next)
-        @info "[$(next.jobExecutionId)]: Adding job $(job.name) to scheduler and scheduling next execution at $(next.scheduledStart)."
+        scheduler.logging && @info "[$(next.jobExecutionId)]: Adding job $(job.name) to scheduler and scheduling next execution at $(next.scheduledStart)."
         sort!(scheduler.jobExecutions, by=je->je.scheduledStart)
     end
     return job
@@ -631,6 +639,19 @@ function runJobs!(store::Store, jobs; kw...)
         wait(sched)
     end
     return jobs
+end
+
+"""
+    SQLiteStore <: Store
+
+A SQLite-backed job storage that uses an InMemoryStore as cache.
+The `db` field holds the SQLite.DB (typed as `Any` to avoid hard dependency).
+The extension `TempusSQLiteExt` provides the constructor and all store methods.
+"""
+struct SQLiteStore <: Store
+    lock::ReentrantLock
+    db::Any  # SQLite.DB — typed Any to avoid hard dep
+    cache::InMemoryStore
 end
 
 end # module

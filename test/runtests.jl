@@ -422,3 +422,12 @@ executed = DateTime[]
         @test length(executed) > 0
     end
 end
+
+@testset "JobOptions keyword forwarding" begin
+    job = Tempus.Job(() -> nothing, "kw_job", "* * * * *"; max_executions=2, retries=1)
+    @test job.options.max_executions == 2
+    @test job.options.retries == 1
+    one_shot = Tempus.OneShotJob(() -> nothing, "oneshot"; retries=3)
+    @test one_shot.options.max_executions == 1
+    @test one_shot.options.retries == 3
+end
