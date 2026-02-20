@@ -1,6 +1,10 @@
-using Test, Dates, Tempus
+using Test, Dates, JSON, SQLite, Tempus
 
 import Tempus: parseCronField, parseCron, getnext
+
+# Named function for FileStore persistence test (anonymous functions can't be persisted)
+_filestore_test_action() = (global executed; push!(executed, Dates.now(UTC)))
+_sqlite_test_action() = nothing
 
 @testset "parseCronField Tests" begin
     # Wildcard: should parse "*" into a Wildcard type.
@@ -403,12 +407,13 @@ executed = DateTime[]
 
     # if job is disabled, it persists through scheduler restart
 
-    # simple FileStore
+    # simple FileStore (requires named function for persistence)
     empty!(executed)
     mktemp() do path, io
+        fs_job = Tempus.Job(_filestore_test_action, "testjob_fs", "* * * * * *")
         fs = Tempus.FileStore(path)
         withscheduler(fs) do sch
-            push!(sch, test_job)
+            push!(sch, fs_job)
             sleep(3)
         end
         @test length(executed) > 0
@@ -423,6 +428,97 @@ executed = DateTime[]
     end
 end
 
+@testset "Scheduler simultaneous-ready regression" begin
+    runs = Ref(0)
+    store = Tempus.InMemoryStore()
+    Tempus.addJob!(store, Tempus.OneShotJob(() -> (runs[] += 1), "simul_a"))
+    Tempus.addJob!(store, Tempus.OneShotJob(() -> (runs[] += 1), "simul_b"))
+    scheduler = Tempus.Scheduler(store; logging=false)
+    try
+        Tempus.run!(scheduler; close_when_no_jobs=true)
+        wait(scheduler)
+    finally
+        close(scheduler)
+    end
+    @test runs[] >= 2
+end
+
+@testset "OneShot max_executions regression" begin
+    runs = Ref(0)
+    job = Tempus.OneShotJob(() -> (runs[] += 1), "oneshot_once")
+    withscheduler(; logging=false) do scheduler
+        push!(scheduler, job)
+        sleep(2)
+    end
+    @test runs[] == 1
+end
+
+@testset "nextJobExecution bounds regression" begin
+    store = Tempus.InMemoryStore()
+    job = Tempus.Job(() -> nothing, "bounds_regression", "* * * * * *";
+        max_failed_executions=3, max_executions=10)
+    Tempus.addJob!(store, job)
+    next = Tempus.nextJobExecution(store, job, 3, 10, nothing; logging=false)
+    @test next isa Tempus.JobExecution
+end
+
+@testset "Queue scheduling dedupe regression" begin
+    job = Tempus.Job("queue_dedupe_regression", "* * * * * *") do
+        sleep(2)
+    end
+    withscheduler(; overlap_policy=:queue, logging=false) do scheduler
+        push!(scheduler, job)
+        sleep(3.5)
+        scheduled = [je.scheduledStart for je in scheduler.jobExecutions if je.job.name == "queue_dedupe_regression"]
+        @test length(scheduled) == length(unique(scheduled))
+    end
+end
+
+@testset "runJobs! single-run regression" begin
+    runs = Ref(0)
+    job = Tempus.OneShotJob(() -> (runs[] += 1), "runjobs_oneshot")
+    Tempus.runJobs!(Tempus.InMemoryStore(), [job]; logging=false)
+    @test runs[] == 1
+end
+
+@testset "Logging no-next regression" begin
+    job = Tempus.Job(() -> nothing, "logging_none_next", "* * * * * *")
+    withscheduler(; logging=true) do scheduler
+        push!(scheduler, job)
+        Tempus.disable!(job)
+        sleep(1.5)
+    end
+    @test true
+end
+
+@testset "SQLite load mapping regression" begin
+    db = SQLite.DB()
+    store = Tempus.SQLiteStore(db)
+    job1 = Tempus.Job(_sqlite_test_action, "sqlite_job_1", "* * * * * *")
+    job2 = Tempus.Job(_sqlite_test_action, "sqlite_job_2", "* * * * * *")
+    Tempus.addJob!(store, job1)
+    Tempus.addJob!(store, job2)
+    je1 = Tempus.JobExecution(job1, DateTime(2024, 1, 1, 0, 0, 0))
+    je1.actualStart = DateTime(2024, 1, 1, 0, 0, 0)
+    je1.finish = DateTime(2024, 1, 1, 0, 0, 1)
+    je1.status = :succeeded
+    je1.result = nothing
+    je1.exception = nothing
+    Tempus.storeJobExecution!(store, je1)
+    je2 = Tempus.JobExecution(job2, DateTime(2024, 1, 1, 0, 1, 0))
+    je2.actualStart = DateTime(2024, 1, 1, 0, 1, 0)
+    je2.finish = DateTime(2024, 1, 1, 0, 1, 1)
+    je2.status = :failed
+    je2.result = nothing
+    je2.exception = ErrorException("expected")
+    Tempus.storeJobExecution!(store, je2)
+    reloaded = Tempus.SQLiteStore(db)
+    @test length(Tempus.getJobs(reloaded)) == 2
+    @test length(Tempus.getNMostRecentJobExecutions(reloaded, "sqlite_job_1", 10)) == 1
+    @test length(Tempus.getNMostRecentJobExecutions(reloaded, "sqlite_job_2", 10)) == 1
+    SQLite.close(db)
+end
+
 @testset "JobOptions keyword forwarding" begin
     job = Tempus.Job(() -> nothing, "kw_job", "* * * * *"; max_executions=2, retries=1)
     @test job.options.max_executions == 2
@@ -430,4 +526,45 @@ end
     one_shot = Tempus.OneShotJob(() -> nothing, "oneshot"; retries=3)
     @test one_shot.options.max_executions == 1
     @test one_shot.options.retries == 3
+end
+
+@testset "Timezone-aware getnext" begin
+    # 9 PM Denver (MST=UTC-7) → 4 AM UTC next day
+    cron = parseCron("0 0 21 * * *")
+    @test getnext(cron, "America/Denver", DateTime(2024,1,15)) == DateTime(2024,1,15,4,0,0)
+
+    # Spring forward: 2:30 AM doesn't exist March 10, 2024 in Denver → skips to next day
+    cron = parseCron("0 30 2 * * *")
+    @test getnext(cron, "America/Denver", DateTime(2024,3,10)) == DateTime(2024,3,11,8,30,0)
+
+    # Fall back: 1:30 AM ambiguous Nov 3, 2024 → first occurrence (MDT, UTC-6)
+    cron = parseCron("0 30 1 * * *")
+    @test getnext(cron, "America/Denver", DateTime(2024,11,3)) == DateTime(2024,11,3,7,30,0)
+
+    # No timezone = existing UTC behavior
+    cron = parseCron("0 0 12 * * *")
+    @test getnext(cron, DateTime(2024,1,15)) == DateTime(2024,1,15,12,0,0)
+end
+
+@testset "Function ref + resolve" begin
+    # Named module function round-trips
+    ref = Tempus._function_ref(Tempus.parseCron)
+    @test ref == "Tempus.parseCron"
+    @test Tempus.resolve_function(ref) === Tempus.parseCron
+
+    # Anonymous function returns nothing
+    @test Tempus._function_ref(() -> nothing) === nothing
+
+    # Bare name resolves via Main
+    @test Tempus.resolve_function("_filestore_test_action") === _filestore_test_action
+end
+
+@testset "Job with params" begin
+    handler(; msg="default") = msg
+    job = Tempus.Job(handler, "param_test", "0 0 * * * *"; job_params=Dict("msg" => "hello"))
+    @test job.action_ref !== nothing
+    @test job.action_data !== nothing
+    parsed = JSON.parse(job.action_data)
+    @test parsed["msg"] == "hello"
+    @test job.action(; parsed...) == "hello"
 end

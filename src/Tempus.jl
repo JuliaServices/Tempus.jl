@@ -11,7 +11,7 @@ Tempus provides a cron-style job scheduling framework for Julia, inspired by Qua
 """
 module Tempus
 
-using Dates, Logging, Serialization
+using Dates, JSON, Logging, TimeZones
 
 export withscheduler
 
@@ -40,6 +40,7 @@ Defines options for job execution behavior.
 - `max_failed_executions::Union{Int, Nothing}`: Maximum number of failed executions allowed for a job before it will be disabled.
 - `max_executions::Union{Int, Nothing}`: Maximum number of executions allowed for a job.
 - `expires_at::Union{DateTime, Nothing}`: Expiration time for a job.
+- `timezone::Union{Nothing, String}`: IANA timezone name (e.g. `"America/Denver"`). When set, the job's cron schedule is interpreted in this timezone. `nothing` means UTC.
 """
 @kwdef struct JobOptions
     overlap_policy::Union{Symbol, Nothing} = nothing # :skip, :queue, :concurrent
@@ -49,9 +50,10 @@ Defines options for job execution behavior.
     max_failed_executions::Union{Int, Nothing} = nothing # max number of failed executions allowed for a job before it will be disabled
     max_executions::Union{Int, Nothing} = nothing # max number of _successful_ executions job is allowed to run
     expires_at::Union{DateTime, Nothing} = nothing # expiration time for job
+    timezone::Union{Nothing, String} = nothing # IANA timezone, e.g. "America/Denver"
 end
 
-Base.show(io::IO, opts::JobOptions) = print(io, "Tempus.JobOptions(overlap_policy=$(opts.overlap_policy), retries=$(opts.retries), retry_delays=$(opts.retry_delays), retry_check=$(opts.retry_check), max_failed_executions=$(opts.max_failed_executions), max_executions=$(opts.max_executions), expires_at=$(opts.expires_at))")
+Base.show(io::IO, opts::JobOptions) = print(io, "Tempus.JobOptions(overlap_policy=$(opts.overlap_policy), retries=$(opts.retries), max_failed_executions=$(opts.max_failed_executions), max_executions=$(opts.max_executions), expires_at=$(opts.expires_at), timezone=$(opts.timezone))")
 
 """
     Job
@@ -60,14 +62,18 @@ Represents a single job/unit of work. Can be scheduled to repeat.
 
 # Fields:
 - `name::String`: Unique identifier for the job.
-- `schedule::Cron`: The cron-style schedule expression.
+- `schedule::Union{Cron, Nothing}`: The cron-style schedule expression.
 - `action::Function`: The function to execute when the job runs.
+- `action_ref::Union{Nothing, String}`: Fully qualified function reference for persistence (e.g. `"MyModule.my_handler"`).
+- `action_data::Union{Nothing, String}`: JSON-encoded parameters for persistence. Splatted as kwargs: `action(; JSON.parse(action_data)...)`.
 - `options::JobOptions`: Execution options for retries, failures, and overlap handling.
 - `disabledAt::Union{DateTime, Nothing}`: Timestamp when the job was disabled (if applicable).
 """
 mutable struct Job
     const lock::ReentrantLock
     const action::Function
+    const action_ref::Union{Nothing, String}
+    const action_data::Union{Nothing, String}
     const name::String
     const schedule::Union{Cron, Nothing}
     const options::JobOptions
@@ -75,11 +81,66 @@ mutable struct Job
     disabledAt::Union{DateTime, Nothing}
 end
 
-Job(action::Function, name, schedule; kw...) = Job(ReentrantLock(), action, string(name), schedule isa Cron ? schedule : parseCron(schedule), JobOptions(; kw...), nothing)
-OneShotJob(action::Function, name; kw...) = Job(ReentrantLock(), action, string(name), nothing, JobOptions(; max_executions=1, kw...), nothing)
+function Job(action::Function, name, schedule;
+        job_params=nothing, action_ref::Union{Nothing,String}=nothing, kw...)
+    ref = action_ref !== nothing ? action_ref : _function_ref(action)
+    data = job_params === nothing ? nothing : JSON.json(job_params)
+    schedule_parsed = schedule isa Cron ? schedule : parseCron(schedule)
+    Job(ReentrantLock(), action, ref, data, string(name), schedule_parsed, JobOptions(; kw...), nothing)
+end
+
+function OneShotJob(action::Function, name;
+        job_params=nothing, action_ref::Union{Nothing,String}=nothing, kw...)
+    ref = action_ref !== nothing ? action_ref : _function_ref(action)
+    data = job_params === nothing ? nothing : JSON.json(job_params)
+    Job(ReentrantLock(), action, ref, data, string(name), nothing, JobOptions(; max_executions=1, kw...), nothing)
+end
+
+"""Auto-extract fully qualified function reference string from a named function."""
+function _function_ref(f::Function)
+    fname = nameof(f)
+    # Detect anonymous functions (can't be persisted)
+    startswith(string(fname), '#') && return nothing
+    mod_path = Base.fullname(parentmodule(f))
+    parts = mod_path[1] == :Main ? mod_path[2:end] : mod_path
+    isempty(parts) && return string(fname)
+    return join([parts..., fname], '.')
+end
+
+"""
+    resolve_function(ref::String) -> Function
+
+Resolve a function from its fully qualified reference string (e.g. `"MyModule.my_handler"`).
+The module must be loaded before calling this function.
+"""
+function resolve_function(ref::String)
+    parts = Symbol.(split(ref, '.'))
+    if length(parts) == 1
+        # Bare function name — look up in Main
+        isdefined(Main, parts[1]) || error("Function $(ref) not found in Main")
+        obj = getproperty(Main, parts[1])
+        obj isa Function || error("$(ref) resolved to $(typeof(obj)), expected Function")
+        return obj
+    end
+    obj = nothing
+    for m in Base.loaded_modules_array()
+        if nameof(m) == parts[1]
+            obj = m
+            break
+        end
+    end
+    obj === nothing && error("Module $(parts[1]) not found in loaded modules. Ensure the module is loaded before restoring jobs.")
+    for i in 2:length(parts)
+        isdefined(obj, parts[i]) || error("$(join(parts[1:i], '.')) not found")
+        obj = getproperty(obj, parts[i])
+    end
+    obj isa Function || error("$(ref) resolved to $(typeof(obj)), expected Function")
+    return obj
+end
 
 function Base.show(io::IO, job::Job)
     println(io, "Job: $(job.name)")
+    job.action_ref === nothing || println(io, "Action: $(job.action_ref)")
     job.schedule === nothing || println(io, "Schedule: $(job.schedule)")
     println(io, "Options: $(job.options)")
     job.disabledAt === nothing || println(io, "Disabled: $(job.disabledAt)")
@@ -117,15 +178,22 @@ function nextJobExecution(store::Store, job::Job, max_failed_executions=job.opti
         return nothing
     end
     # check if max number of failed executions has been reached
-    if something(max_failed_executions, 0) < something(max_executions, 0)
-        execs = execs[1:max_failed_executions]
+    if max_failed_executions !== nothing && max_executions !== nothing && max_failed_executions < max_executions
+        execs = @view execs[1:min(max_failed_executions, length(execs))]
     end
     if max_failed_executions !== nothing && count(e -> e.status == :failed, execs) >= max_failed_executions
         logging && @info "Disabling job $(job.name) after reaching maximum number of failed executions: $(max_failed_executions)."
         disable!(job)
         return nothing
     end
-    time = job.schedule === nothing ? Dates.now(UTC) : getnext(job.schedule)
+    tz = job.options.timezone
+    time = if job.schedule === nothing
+        Dates.now(UTC)
+    elseif tz !== nothing
+        getnext(job.schedule, tz)
+    else
+        getnext(job.schedule)
+    end
     return JobExecution(job, time)
 end
 
@@ -303,13 +371,16 @@ function storeJobExecution!(store::InMemoryStore, jobExecution::JobExecution)
     return
 end
 
+const _FILESTORE_VERSION = 2
+
 """
     FileStore <: Store
 
-A file-based job storage backend that persists jobs and execution history to disk.
+A file-based job storage backend that persists jobs to disk as JSON.
+Job execution history is only kept in memory (not persisted).
 
 # Fields:
-- `filepath::String`: The file path where jobs are serialized.
+- `filepath::String`: The file path where jobs are stored as JSON.
 - `store::InMemoryStore`: In-memory store that handles operations before syncing to disk.
 """
 struct FileStore <: Store
@@ -319,21 +390,65 @@ struct FileStore <: Store
 end
 
 function FileStore(filepath::String)
-    store = isfile(filepath) && filesize(filepath) > 0 ? deserialize(filepath) : InMemoryStore()
+    store = InMemoryStore()
+    if isfile(filepath) && filesize(filepath) > 0
+        data = JSON.parse(read(filepath, String))
+        v = get(data, "version", nothing)
+        v == _FILESTORE_VERSION || error("Incompatible FileStore version: $v (expected $_FILESTORE_VERSION)")
+        for jd in get(data, "jobs", [])
+            ar = get(jd, "action_ref", nothing)
+            if ar === nothing
+                @warn "Skipping job $(jd["name"]): anonymous functions cannot be persisted"
+                continue
+            end
+            action = resolve_function(ar)
+            schedule = get(jd, "schedule", nothing)
+            schedule = schedule === nothing ? nothing : parseCron(String(strip(schedule, '"')))
+            opts = JobOptions(;
+                overlap_policy = let v = get(jd, "overlap_policy", nothing); v === nothing ? nothing : Symbol(v) end,
+                retries = get(jd, "retries", 0),
+                max_failed_executions = get(jd, "max_failed_executions", nothing),
+                max_executions = get(jd, "max_executions", nothing),
+                expires_at = let v = get(jd, "expires_at", nothing); v === nothing ? nothing : DateTime(v) end,
+                timezone = get(jd, "timezone", nothing),
+            )
+            disabled_at = let v = get(jd, "disabled_at", nothing); v === nothing ? nothing : DateTime(v) end
+            action_data = get(jd, "action_data", nothing)
+            job = Job(ReentrantLock(), action, jd["action_ref"], action_data, jd["name"], schedule, opts, disabled_at)
+            push!(store.jobs, job)
+        end
+    end
     return FileStore(ReentrantLock(), filepath, store)
+end
+
+function _sync_filestore(store::FileStore)
+    jobs = [Dict{String,Any}(
+        "name" => j.name,
+        "action_ref" => j.action_ref,
+        "action_data" => j.action_data,
+        "schedule" => j.schedule === nothing ? nothing : strip(string(j.schedule), '"'),
+        "overlap_policy" => j.options.overlap_policy === nothing ? nothing : string(j.options.overlap_policy),
+        "retries" => j.options.retries,
+        "max_failed_executions" => j.options.max_failed_executions,
+        "max_executions" => j.options.max_executions,
+        "expires_at" => j.options.expires_at === nothing ? nothing : string(j.options.expires_at),
+        "timezone" => j.options.timezone,
+        "disabled_at" => j.disabledAt === nothing ? nothing : string(j.disabledAt),
+    ) for j in store.store.jobs]
+    write(store.filepath, JSON.json(Dict("version" => _FILESTORE_VERSION, "jobs" => jobs)))
 end
 
 function addJob!(store::FileStore, job::Job)
     @lock store.lock begin
         addJob!(store.store, job)
-        serialize(store.filepath, store.store)
+        _sync_filestore(store)
     end
 end
 
 function purgeJob!(store::FileStore, job::Job)
     @lock store.lock begin
         purgeJob!(store.store, job)
-        serialize(store.filepath, store.store)
+        _sync_filestore(store)
     end
 end
 
@@ -343,7 +458,6 @@ getNMostRecentJobExecutions(store::FileStore, jobName::String, n::Int) = getNMos
 function storeJobExecution!(store::FileStore, jobExecution::JobExecution)
     @lock store.lock begin
         storeJobExecution!(store.store, jobExecution)
-        serialize(store.filepath, store.store)
     end
     return
 end
@@ -438,7 +552,7 @@ function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
                         elseif length(scheduler.executingJobExecutions) >= scheduler.max_concurrent_executions
                             # scheduler is already executing at limit, keep execution queued, but check to schedule next execution
                             next = nextJobExecution(scheduler, je.job)
-                            if next !== nothing && !any(j -> j.job.name == je.job.name && j.scheduledStart == next, scheduler.jobExecutions)
+                            if next !== nothing && !any(j -> j.job.name == je.job.name && j.scheduledStart == next.scheduledStart, scheduler.jobExecutions)
                                 push!(scheduler.jobExecutions, next)
                             end
                         elseif any(j -> j.job.name == je.job.name, scheduler.executingJobExecutions)
@@ -452,7 +566,7 @@ function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
                                 nexecs = count(j -> j.job.name == je.job.name, scheduler.jobExecutions)
                                 scheduler.logging && @warn "Job $(je.job.name) already executing, keeping scheduled execution queued until current execution finishes. There are $nexecs queued for this job."
                                 next = nextJobExecution(scheduler, je.job)
-                                if next !== nothing && !any(j -> j.job.name == je.job.name && j.scheduledStart == next, scheduler.jobExecutions)
+                                if next !== nothing && !any(j -> j.job.name == je.job.name && j.scheduledStart == next.scheduledStart, scheduler.jobExecutions)
                                     push!(scheduler.jobExecutions, next)
                                 end
                             end
@@ -466,19 +580,33 @@ function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
                 end
                 # remove job executions that are ready or to be skipped while holding the lock and schedule next execution
                 if !isempty(readyToExecute)
+                    # remove from highest index first so earlier deletes don't shift later indices
+                    sort!(readyToExecute, by=x -> x[1], rev=true)
                     for (i, toSkip, je) in readyToExecute
                         deleteat!(scheduler.jobExecutions, i)
                         next = nextJobExecution(scheduler, je.job)
-                        if next !== nothing && !any(j -> j.job.name == je.job.name && j.scheduledStart == next, scheduler.jobExecutions)
+                        if next !== nothing && !any(j -> j.job.name == je.job.name && j.scheduledStart == next.scheduledStart, scheduler.jobExecutions)
                             push!(scheduler.jobExecutions, next)
                         end
                         if scheduler.logging
-                            if isdisabled(je.job) !== nothing
-                                @info "[$(je.jobExecutionId)]: Skipping disabled job $(je.job.name) (disabled at $(je.job.disabledAt)) execution at $(now), next scheduled at $(next.scheduledStart)"
+                            if isdisabled(je.job)
+                                if next !== nothing
+                                    @info "[$(je.jobExecutionId)]: Skipping disabled job $(je.job.name) (disabled at $(je.job.disabledAt)) execution at $(now), next scheduled at $(next.scheduledStart)"
+                                else
+                                    @info "[$(je.jobExecutionId)]: Skipping disabled job $(je.job.name) (disabled at $(je.job.disabledAt)) execution at $(now), no next execution scheduled"
+                                end
                             elseif toSkip
-                                @info "[$(je.jobExecutionId)]: Skipping job $(je.job.name) execution at $(now), next scheduled at $(next.scheduledStart)"
+                                if next !== nothing
+                                    @info "[$(je.jobExecutionId)]: Skipping job $(je.job.name) execution at $(now), next scheduled at $(next.scheduledStart)"
+                                else
+                                    @info "[$(je.jobExecutionId)]: Skipping job $(je.job.name) execution at $(now), no next execution scheduled"
+                                end
                             else
-                                @info "[$(je.jobExecutionId)]: Job $(je.job.name) execution scheduled at $(next.scheduledStart)"
+                                if next !== nothing
+                                    @info "[$(je.jobExecutionId)]: Job $(je.job.name) execution scheduled at $(next.scheduledStart)"
+                                else
+                                    @info "[$(je.jobExecutionId)]: Job $(je.job.name) execution scheduled at $(now), no next execution scheduled"
+                                end
                             end
                         end
                     end
@@ -525,9 +653,13 @@ function executeJob!(scheduler::Scheduler, jobExecution::JobExecution)
             end
             return should_retry
         end
-        f = _some(jobExecution.job.options.retry_delays, scheduler.jobOptions.retry_delays) !== nothing ?
-            Base.retry(jobExecution.job.action; delays=_some(jobExecution.job.options.retry_delays, scheduler.jobOptions.retry_delays), check=check) :
+        data = jobExecution.job.action_data
+        base_action = data !== nothing ?
+            () -> jobExecution.job.action(; JSON.parse(data)...) :
             jobExecution.job.action
+        f = _some(jobExecution.job.options.retry_delays, scheduler.jobOptions.retry_delays) !== nothing ?
+            Base.retry(base_action; delays=_some(jobExecution.job.options.retry_delays, scheduler.jobOptions.retry_delays), check=check) :
+            base_action
         jobExecution.actualStart = now
         try
             jobExecution.result = Base.invokelatest(f)
@@ -543,12 +675,13 @@ function executeJob!(scheduler::Scheduler, jobExecution::JobExecution)
         end
         # store the job execution
         storeJobExecution!(scheduler.store, jobExecution)
-        # check if job should be disabled or unscheduled based on on_fail_policy
-        if jobExecution.status == :failed
-            # getting the next job execution checks if it should be disabled
-            nextJobExecution(scheduler, jobExecution.job)
-        end
+        # run next execution eligibility checks with the latest execution persisted
+        next = nextJobExecution(scheduler, jobExecution.job)
         @lock scheduler.lock begin
+            if next === nothing
+                # if the job should not be scheduled again, drop any queued executions for it
+                filter!(je -> je.job.name != jobExecution.job.name, scheduler.jobExecutions)
+            end
             delete!(scheduler.executingJobExecutions, jobExecution)
             !scheduler.running && isempty(scheduler.executingJobExecutions) && notify(scheduler.jobExecutionFinished)
         end
@@ -634,9 +767,12 @@ function runJobs!(store::Store, jobs; kw...)
     for job in jobs
         addJob!(store, job)
     end
-    withscheduler(store; kw...) do sched
-        run!(sched; close_when_no_jobs=true)
-        wait(sched)
+    scheduler = Scheduler(store; kw...)
+    try
+        run!(scheduler; close_when_no_jobs=true)
+        wait(scheduler)
+    finally
+        close(scheduler)
     end
     return jobs
 end
