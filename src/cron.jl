@@ -302,3 +302,48 @@ function getnext(cron::Cron, from::DateTime=Dates.now(UTC))
         return trunc(next, Second)
     end
 end
+
+"""
+    getnext(cron::Cron, timezone::String, from::DateTime=Dates.now(UTC)) -> DateTime
+
+Compute the next trigger time for `cron` interpreted in `timezone` (IANA name, e.g. `"America/Denver"`).
+`from` is a UTC DateTime. Returns a UTC DateTime.
+DST handling: spring-forward gaps are skipped, fall-back ambiguities use the first occurrence.
+"""
+function getnext(cron::Cron, timezone::String, from::DateTime=Dates.now(UTC))
+    tz = TimeZone(timezone)
+    # Convert UTC "from" to local time in the target timezone
+    from_local = DateTime(ZonedDateTime(from, tz; from_utc=true))
+    # Find next cron match in local time (reuses the existing UTC-agnostic algorithm)
+    next_local = getnext(cron, from_local)
+    # Convert back to UTC, handling DST transitions
+    next_utc = _local_to_utc(next_local, tz, cron)
+    # Safety: if result <= from (possible around fall-back), advance and retry
+    if next_utc <= from
+        next_local2 = getnext(cron, next_local + Second(1))
+        next_utc = _local_to_utc(next_local2, tz, cron)
+    end
+    return next_utc
+end
+
+function _local_to_utc(local_dt::DateTime, tz::TimeZone, cron::Cron)
+    try
+        zdt = ZonedDateTime(local_dt, tz)
+        return DateTime(zdt, UTC)
+    catch e
+        if e isa TimeZones.NonExistentTimeError
+            # Spring forward: this local time doesn't exist (e.g. 2:30 AM during spring-forward).
+            # Skip to end of gap and find the next valid cron match.
+            advanced = trunc(local_dt + Hour(1), Hour)
+            next_local = getnext(cron, advanced - Second(1))
+            zdt = ZonedDateTime(next_local, tz)
+            return DateTime(zdt, UTC)
+        elseif e isa TimeZones.AmbiguousTimeError
+            # Fall back: this local time occurs twice. Use first occurrence (before clocks change).
+            zdt = ZonedDateTime(local_dt, tz, 1)
+            return DateTime(zdt, UTC)
+        else
+            rethrow()
+        end
+    end
+end
