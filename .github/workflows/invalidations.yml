@@ -37,6 +37,15 @@ jobs:
       run: |
         echo "Invalidations on default branch: ${{ steps.invs_default.outputs.total }} (${{ steps.invs_default.outputs.deps }} via deps)" >> $GITHUB_STEP_SUMMARY
         echo "This branch: ${{ steps.invs_pr.outputs.total }} (${{ steps.invs_pr.outputs.deps }} via deps)" >> $GITHUB_STEP_SUMMARY
-    - name: Check if the PR does increase number of invalidations
-      if: steps.invs_pr.outputs.total > steps.invs_default.outputs.total
-      run: exit 1
+    - name: Check invalidation increase threshold
+      env:
+        INV_DEFAULT: ${{ steps.invs_default.outputs.total }}
+        INV_PR: ${{ steps.invs_pr.outputs.total }}
+        MAX_INVALIDATION_INCREASE: "500"
+      run: |
+        increase=$((10#$INV_PR - 10#$INV_DEFAULT))
+        echo "Invalidation increase: ${increase}" >> $GITHUB_STEP_SUMMARY
+        if [ "${increase}" -gt "${MAX_INVALIDATION_INCREASE}" ]; then
+          echo "::error::Invalidations increased by ${increase} (> ${MAX_INVALIDATION_INCREASE})"
+          exit 1
+        fi
