@@ -12,6 +12,7 @@ Tempus provides a cron-style job scheduling framework for Julia, inspired by Qua
 module Tempus
 
 using Dates, JSON, Logging, TimeZones
+import AbstractStores
 
 export withscheduler
 
@@ -23,9 +24,14 @@ _some(x) = x
 """
     Store
 
-Defines an interface for job storage backends.
+Two typed `AbstractStore` views used by a scheduler: jobs by name and bounded
+execution history by job name. Applications choose the shared backend.
 """
-abstract type Store end
+struct Store{J<:AbstractStores.AbstractStore,E<:AbstractStores.AbstractStore}
+    jobs::J
+    executions::E
+    history_limit::Int
+end
 
 """
     JobOptions
@@ -165,7 +171,7 @@ function nextJobExecution(store::Store, job::Job, max_failed_executions=job.opti
     # check if job has expired
     if expires_at !== nothing && expires_at < Dates.now(UTC)
         logging && @info "Disabling job $(job.name) due to expiration: $(expires_at)."
-        disable!(job)
+        disableJob!(store, job)
         return nothing
     end
     # pull job execution history for other checks
@@ -174,7 +180,7 @@ function nextJobExecution(store::Store, job::Job, max_failed_executions=job.opti
     # check if max number of executions has been reached
     if max_executions !== nothing && count(e -> e.status == :succeeded, execs) >= max_executions
         logging && @info "Disabling job $(job.name) after reaching maximum number of successful executions: $(max_executions)."
-        disable!(job)
+        disableJob!(store, job)
         return nothing
     end
     # check if max number of failed executions has been reached
@@ -183,7 +189,7 @@ function nextJobExecution(store::Store, job::Job, max_failed_executions=job.opti
     end
     if max_failed_executions !== nothing && count(e -> e.status == :failed, execs) >= max_failed_executions
         logging && @info "Disabling job $(job.name) after reaching maximum number of failed executions: $(max_failed_executions)."
-        disable!(job)
+        disableJob!(store, job)
         return nothing
     end
     tz = job.options.timezone
@@ -263,203 +269,146 @@ function Base.show(io::IO, je::JobExecution)
     return
 end
 
-# interface for Stores
 """
-    getJobs(store::Store) -> Collection{Job}
+    Store(backend; prefix="tempus/", history_limit=100)
 
-Retrieve all jobs stored in `store`, regardless of disabled status.
+Create job and execution-history views over one `AbstractStore` backend.
+Namespacing lets Tempus share a physical store with other libraries and
+application state. The backend must accept both `Job` and
+`Vector{JobExecution}` values, such as an `AbstractStore{Any}`.
 """
-function getJobs end
-
-"""
-    addJob!(store::Store, job::Job)
-
-Add a new `job` to `store`.
-"""
-function addJob! end
-
-"""
-    purgeJob!(store::Store, job::Union{Job, String})
-
-Remove a `job` from `store` by reference or name.
-All job execution history will also be removed.
-"""
-function purgeJob! end
-
-"""
-    storeJobExecution!(store::Store, jobExecution::JobExecution)
-
-Store `jobExecution` in `store`.
-"""
-function storeJobExecution!(store::Store, jobExecution::JobExecution) end
+function Store(
+    backend::AbstractStores.AbstractStore;
+    prefix::AbstractString="tempus/",
+    history_limit::Int=100,
+)
+    history_limit > 0 || throw(ArgumentError("history_limit must be positive"))
+    return Store(
+        AbstractStores.PrefixedStore{Job}(backend, string(prefix, "jobs/")),
+        AbstractStores.PrefixedStore{Vector{JobExecution}}(
+            backend,
+            string(prefix, "executions/"),
+        ),
+        history_limit,
+    )
+end
 
 """
-    getNMostRecentJobExecutions(store::Store, jobName::String, n::Int) -> Vector{JobExecution}
+    Store(jobs, executions; history_limit=100)
 
-Get the `n` most recent job executions for a job persisted in `store`.
+Create a store from separate typed job and execution-history backends.
 """
-function getNMostRecentJobExecutions(store::Store, jobName::String, n::Int) end
+function Store(
+    jobs::AbstractStores.AbstractStore{Job},
+    executions::AbstractStores.AbstractStore{Vector{JobExecution}};
+    history_limit::Int=100,
+)
+    history_limit > 0 || throw(ArgumentError("history_limit must be positive"))
+    return Store(jobs, executions, history_limit)
+end
 
-# fallback for purging job by name
-function purgeJob!(store::Store, jobName::String)
-    jobs = getJobs(store)
-    for job in jobs
-        if job.name == jobName
-            purgeJob!(store, job)
-            return
-        end
+"""Create a process-local Tempus store."""
+InMemoryStore(; kw...) = Store(AbstractStores.MemoryStore(); kw...)
+
+"""
+    FileStore(directory; kw...)
+
+Create a Tempus store backed by an `AbstractStores.FileStore`. `directory` is a
+directory, not the single JSON file used by Tempus 2.
+"""
+FileStore(directory::AbstractString; kw...) =
+    Store(AbstractStores.FileStore(directory); kw...)
+
+"""
+    SQLiteStore(connection; table="tempus_state", kw...)
+
+Compatibility constructor for a Tempus store backed by one
+`AbstractStores.SQLStore` table. The same `Store(SQLStore(...))` form works for
+SQLite, Postgres, and other DBInterface drivers.
+"""
+function SQLiteStore(connection; table::AbstractString="tempus_state", kw...)
+    backend = AbstractStores.SQLStore{Any}(connection; table)
+    return Store(backend; kw...)
+end
+
+"""Return every stored job, regardless of disabled status."""
+getJobs(store::Store) = [store.jobs[name] for name in keys(store.jobs)]
+
+"""Add or replace a job by name."""
+function addJob!(store::Store, job::Job)
+    put!(store.jobs, job.name, job)
+    return job
+end
+
+"""Remove a job and all execution history for that job."""
+function purgeJob!(store::Store, job::Union{Job,AbstractString})
+    name = job isa Job ? job.name : String(job)
+    delete!(store.jobs, name)
+    delete!(store.executions, name)
+    return nothing
+end
+
+function disabled_copy(job::Job, at::DateTime)
+    return Job(
+        ReentrantLock(),
+        job.action,
+        job.action_ref,
+        job.action_data,
+        job.name,
+        job.schedule,
+        job.options,
+        at,
+    )
+end
+
+"""
+    disableJob!(store, job; at=Dates.now(UTC))
+
+Disable a stored job by reference or name. The update uses the backend atomic
+read-modify-write operation.
+"""
+function disableJob!(
+    store::Store,
+    job::Union{Job,AbstractString};
+    at::DateTime=Dates.now(UTC),
+)
+    name = job isa Job ? job.name : String(job)
+    updated = AbstractStores.modify!(store.jobs, name) do current
+        current === nothing ? nothing : disabled_copy(current, at)
     end
-    return
+    if job isa Job && updated !== nothing
+        @lock job.lock job.disabledAt = at
+    end
+    return updated
 end
 
 """
-    disableJob!(store::Store, job::Union{Job, String})
-    
-Disable a `job` in `store` by reference or name.
+    storeJobExecution!(store, execution)
+
+Prepend one execution to the job history and keep at most `history_limit`
+records. The update is atomic when the selected backend provides atomic
+`modify!`.
 """
-function disableJob!(store::Store, job::Union{Job, String})
-    jobName = job isa Job ? job.name : job
-    jobs = getJobs(store)
-    for j in jobs
-        if j.name == jobName
-            disable!(j)
-            return
-        end
+function storeJobExecution!(store::Store, execution::JobExecution)
+    AbstractStores.modify!(store.executions, execution.job.name) do current
+        history = current === nothing ? JobExecution[] : copy(current)
+        pushfirst!(history, execution)
+        resize!(history, min(length(history), store.history_limit))
+        return history
     end
-    return
+    return execution
 end
 
-"""
-    InMemoryStore <: Store
-
-An in-memory job storage backend.
-
-# Fields:
-- `jobs::Set{Job}`: Stores active jobs.
-- `jobExecutions::Dict{String, Vector{JobExecution}}`: Stores execution history for each job.
-"""
-struct InMemoryStore <: Store
-    lock::ReentrantLock
-    jobs::Set{Job}
-    jobExecutions::Dict{String, Vector{JobExecution}} # job executions stored most recent first
-end
-
-InMemoryStore() = InMemoryStore(ReentrantLock(), Set{Job}(), Dict{String, Vector{JobExecution}}())
-
-addJob!(store::InMemoryStore, job::Job) = @lock store.lock push!(store.jobs, job)
-
-function purgeJob!(store::InMemoryStore, job::Job)
-    @lock store.lock begin
-        delete!(store.jobs, job)
-        delete!(store.jobExecutions, job.name)
-    end
-end
-
-getJobs(store::InMemoryStore) = store.jobs
-
-function getNMostRecentJobExecutions(store::InMemoryStore, jobName::String, n::Int)
-    n == 0 && return JobExecution[]
-    execs = @lock store.lock get(() -> JobExecution[], store.jobExecutions, jobName)
-    return @view execs[1:min(n, length(execs))]
-end
-
-function storeJobExecution!(store::InMemoryStore, jobExecution::JobExecution)
-    @lock store.lock begin
-        execs = get!(() -> JobExecution[], store.jobExecutions, jobExecution.job.name)
-        pushfirst!(execs, jobExecution)
-    end
-    return
-end
-
-const _FILESTORE_VERSION = 2
-
-"""
-    FileStore <: Store
-
-A file-based job storage backend that persists jobs to disk as JSON.
-Job execution history is only kept in memory (not persisted).
-
-# Fields:
-- `filepath::String`: The file path where jobs are stored as JSON.
-- `store::InMemoryStore`: In-memory store that handles operations before syncing to disk.
-"""
-struct FileStore <: Store
-    lock::ReentrantLock
-    filepath::String
-    store::InMemoryStore
-end
-
-function FileStore(filepath::String)
-    store = InMemoryStore()
-    if isfile(filepath) && filesize(filepath) > 0
-        data = JSON.parse(read(filepath, String))
-        v = get(data, "version", nothing)
-        v == _FILESTORE_VERSION || error("Incompatible FileStore version: $v (expected $_FILESTORE_VERSION)")
-        for jd in get(data, "jobs", [])
-            ar = get(jd, "action_ref", nothing)
-            if ar === nothing
-                @warn "Skipping job $(jd["name"]): anonymous functions cannot be persisted"
-                continue
-            end
-            action = resolve_function(ar)
-            schedule = get(jd, "schedule", nothing)
-            schedule = schedule === nothing ? nothing : parseCron(String(strip(schedule, '"')))
-            opts = JobOptions(;
-                overlap_policy = let v = get(jd, "overlap_policy", nothing); v === nothing ? nothing : Symbol(v) end,
-                retries = get(jd, "retries", 0),
-                max_failed_executions = get(jd, "max_failed_executions", nothing),
-                max_executions = get(jd, "max_executions", nothing),
-                expires_at = let v = get(jd, "expires_at", nothing); v === nothing ? nothing : DateTime(v) end,
-                timezone = get(jd, "timezone", nothing),
-            )
-            disabled_at = let v = get(jd, "disabled_at", nothing); v === nothing ? nothing : DateTime(v) end
-            action_data = get(jd, "action_data", nothing)
-            job = Job(ReentrantLock(), action, jd["action_ref"], action_data, jd["name"], schedule, opts, disabled_at)
-            push!(store.jobs, job)
-        end
-    end
-    return FileStore(ReentrantLock(), filepath, store)
-end
-
-function _sync_filestore(store::FileStore)
-    jobs = [Dict{String,Any}(
-        "name" => j.name,
-        "action_ref" => j.action_ref,
-        "action_data" => j.action_data,
-        "schedule" => j.schedule === nothing ? nothing : strip(string(j.schedule), '"'),
-        "overlap_policy" => j.options.overlap_policy === nothing ? nothing : string(j.options.overlap_policy),
-        "retries" => j.options.retries,
-        "max_failed_executions" => j.options.max_failed_executions,
-        "max_executions" => j.options.max_executions,
-        "expires_at" => j.options.expires_at === nothing ? nothing : string(j.options.expires_at),
-        "timezone" => j.options.timezone,
-        "disabled_at" => j.disabledAt === nothing ? nothing : string(j.disabledAt),
-    ) for j in store.store.jobs]
-    write(store.filepath, JSON.json(Dict("version" => _FILESTORE_VERSION, "jobs" => jobs)))
-end
-
-function addJob!(store::FileStore, job::Job)
-    @lock store.lock begin
-        addJob!(store.store, job)
-        _sync_filestore(store)
-    end
-end
-
-function purgeJob!(store::FileStore, job::Job)
-    @lock store.lock begin
-        purgeJob!(store.store, job)
-        _sync_filestore(store)
-    end
-end
-
-getJobs(store::FileStore) = getJobs(store.store)
-getNMostRecentJobExecutions(store::FileStore, jobName::String, n::Int) = getNMostRecentJobExecutions(store.store, jobName, n)
-
-function storeJobExecution!(store::FileStore, jobExecution::JobExecution)
-    @lock store.lock begin
-        storeJobExecution!(store.store, jobExecution)
-    end
-    return
+"""Return at most `n` execution records, newest first."""
+function getNMostRecentJobExecutions(
+    store::Store,
+    job_name::String,
+    n::Int,
+)
+    n <= 0 && return JobExecution[]
+    history = get(store.executions, job_name, nothing)
+    history === nothing && return JobExecution[]
+    return history[1:min(n, length(history))]
 end
 
 """
@@ -501,6 +450,9 @@ mutable struct Scheduler
         logging::Bool=true,
     ) = new(ReentrantLock(), JobExecution[], store, Threads.Event(), Set{JobExecution}(), false, JobOptions(; overlap_policy, retries, retry_delays, retry_check, max_failed_executions, max_executions, expires_at), max_concurrent_executions, logging)
 end
+
+Scheduler(backend::AbstractStores.AbstractStore; kw...) =
+    Scheduler(Store(backend); kw...)
 
 function Base.show(io::IO, scheduler::Scheduler)
     println(io, "Scheduler:")
@@ -777,17 +729,7 @@ function runJobs!(store::Store, jobs; kw...)
     return jobs
 end
 
-"""
-    SQLiteStore <: Store
-
-A SQLite-backed job storage that uses an InMemoryStore as cache.
-The `db` field holds the SQLite.DB (typed as `Any` to avoid hard dependency).
-The extension `TempusSQLiteExt` provides the constructor and all store methods.
-"""
-struct SQLiteStore <: Store
-    lock::ReentrantLock
-    db::Any  # SQLite.DB — typed Any to avoid hard dep
-    cache::InMemoryStore
-end
+runJobs!(backend::AbstractStores.AbstractStore, jobs; kw...) =
+    runJobs!(Store(backend), jobs; kw...)
 
 end # module

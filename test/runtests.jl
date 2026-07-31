@@ -1,8 +1,8 @@
-using Test, Dates, JSON, SQLite, Tempus
+using Test, AbstractStores, Dates, JSON, SQLite, Tempus
 
 import Tempus: parseCronField, parseCron, getnext
 
-# Named function for FileStore persistence test (anonymous functions can't be persisted)
+# A named function remains resolvable when a persistent store is reopened.
 _filestore_test_action() = (global executed; push!(executed, Dates.now(UTC)))
 _sqlite_test_action() = nothing
 
@@ -407,9 +407,9 @@ executed = DateTime[]
 
     # if job is disabled, it persists through scheduler restart
 
-    # simple FileStore (requires named function for persistence)
+    # FileStore uses a directory and persists both jobs and execution history.
     empty!(executed)
-    mktemp() do path, io
+    mktempdir() do path
         fs_job = Tempus.Job(_filestore_test_action, "testjob_fs", "* * * * * *")
         fs = Tempus.FileStore(path)
         withscheduler(fs) do sch
@@ -417,15 +417,55 @@ executed = DateTime[]
             sleep(3)
         end
         @test length(executed) > 0
-        # now run again, checking that our job was successfully persisted in the file
+        @test !isempty(
+            Tempus.getNMostRecentJobExecutions(fs, "testjob_fs", 10),
+        )
+
+        # Reopen the same backend and verify both forms of state survived.
         empty!(executed)
         fs = Tempus.FileStore(path)
+        @test !isempty(
+            Tempus.getNMostRecentJobExecutions(fs, "testjob_fs", 10),
+        )
         withscheduler(fs) do sch
             sleep(3)
         end
-        @show executed
         @test length(executed) > 0
     end
+end
+
+@testset "AbstractStores-backed state" begin
+    backend = MemoryStore()
+    store = Tempus.Store(backend; prefix="scheduler/", history_limit=2)
+    job = Tempus.Job(() -> nothing, "bounded", "* * * * * *")
+    Tempus.addJob!(store, job)
+    @test collect(keys(backend; prefix="scheduler/jobs/")) ==
+        ["scheduler/jobs/bounded"]
+
+    for second in 1:3
+        execution = Tempus.JobExecution(
+            job,
+            DateTime(2024, 1, 1, 0, 0, second),
+        )
+        execution.actualStart = execution.scheduledStart
+        execution.finish = execution.scheduledStart
+        execution.status = :succeeded
+        execution.result = nothing
+        execution.exception = nothing
+        Tempus.storeJobExecution!(store, execution)
+    end
+    history = Tempus.getNMostRecentJobExecutions(store, job.name, 10)
+    @test length(history) == 2
+    @test history[1].scheduledStart == DateTime(2024, 1, 1, 0, 0, 3)
+
+    disabled_at = DateTime(2024, 1, 2)
+    Tempus.disableJob!(store, job; at=disabled_at)
+    @test only(Tempus.getJobs(store)).disabledAt == disabled_at
+    @test job.disabledAt == disabled_at
+
+    Tempus.purgeJob!(store, job.name)
+    @test isempty(Tempus.getJobs(store))
+    @test isempty(Tempus.getNMostRecentJobExecutions(store, job.name, 10))
 end
 
 @testset "Scheduler simultaneous-ready regression" begin

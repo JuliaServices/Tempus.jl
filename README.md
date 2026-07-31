@@ -11,7 +11,7 @@
 ### Features
 - Define jobs using cron-style scheduling expressions
 - Support for job execution policies (overlap handling, retries, failure strategies)
-- In-memory and file-based job storage backends
+- Backend-neutral state through AbstractStores.jl
 - Thread-safe scheduling with concurrency-aware execution
 - Dynamic job control (enable, disable, unschedule jobs)
 - Supports retry policies with exponential backoff
@@ -31,7 +31,11 @@ Pkg.add("Tempus")
 using Tempus
 
 # Define a job that prints a message every minute
-job = Tempus.Job("example_job", "* * * * *", () -> println("Hello from Tempus!"))
+job = Tempus.Job(
+    () -> println("Hello from Tempus!"),
+    "example_job",
+    "* * * * *",
+)
 
 # Create an in-memory scheduler
 scheduler = Tempus.Scheduler()
@@ -54,12 +58,43 @@ Tempus.enable!(job)   # Allows it to run again
 Tempus.unschedule!(scheduler, job)
 ```
 
-### Using a File-Based Job Store
-To persist job execution history across restarts, use a file-based store:
+### Choosing a State Backend
+
+Tempus stores jobs and bounded execution history as two namespaced views over
+one AbstractStores backend. The backend must accept heterogeneous values. The
+default scheduler uses process memory:
+
 ```julia
-store = Tempus.FileStore("jobs.dat")
+using AbstractStores, Tempus
+
+backend = MemoryStore()
+store = Tempus.Store(backend)
 scheduler = Tempus.Scheduler(store)
 ```
+
+Change only the backend to persist jobs and execution history across restarts:
+
+```julia
+backend = FileStore(joinpath(homedir(), ".tempus", "state"))
+scheduler = Tempus.Scheduler(backend)
+```
+
+The same form works with `RedisStore` and `SQLStore`. One backend can also hold
+state for several libraries and the application because each user gets a
+separate prefix:
+
+```julia
+backend = SQLStore{Any}(connection; table="service_state")
+tempus = Tempus.Store(backend; prefix="tempus/")
+```
+
+`Tempus.InMemoryStore()`, `Tempus.FileStore(directory)`, and
+`Tempus.SQLiteStore(connection)` remain as convenience constructors. The
+Tempus 2 file store used one JSON file. The new file constructor takes a
+directory and writes one atomic file per key. Use named functions from a module
+that is loaded before reopening a persistent store. Anonymous functions and
+Julia's native serialized representation are not stable across Julia sessions
+or Julia versions.
 
 ## Cron Syntax
 Tempus.jl uses a familiar cron syntax for scheduling:

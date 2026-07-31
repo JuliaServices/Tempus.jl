@@ -3,18 +3,17 @@ uuid = "e6262be2-5787-4bdc-bc3f-4b5a3442fa30"
 version = "2.0.0"
 
 [deps]
+AbstractStores = "b8592f88-5fd7-4e10-8c52-04e8e19aea3c"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
 TimeZones = "f269a46b-ccf7-5d73-abea-4c690281aa53"
 
-[weakdeps]
-SQLite = "0aa819cd-b072-5ff4-a722-6bc24af294d9"
-
-[extensions]
-TempusSQLiteExt = "SQLite"
+[sources]
+AbstractStores = {url = "https://github.com/JuliaServices/AbstractStores.jl.git", rev = "4900d65ab7a370ef770b8fe0759d19635842f64c"}
 
 [compat]
+AbstractStores = "0.1"
 JSON = "1"
 SQLite = "1"
 TimeZones = "1"
