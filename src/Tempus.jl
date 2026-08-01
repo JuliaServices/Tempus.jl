@@ -207,6 +207,10 @@ end
     disable!(job::Job)
 
 Disables a job, preventing it from being scheduled for execution.
+
+This mutates the `Job` object only. A persisting store holds a *copy* of the job,
+so use [`disableJob!`](@ref)`(store, job)` when the change must survive a
+restart.
 """
 disable!(job::Job) = (@lock job.lock (job.disabledAt = Dates.now(UTC)))
 
@@ -214,6 +218,10 @@ disable!(job::Job) = (@lock job.lock (job.disabledAt = Dates.now(UTC)))
     enable!(job::Job)
 
 Enables a previously disabled job, allowing it to be scheduled again.
+
+Like [`disable!`](@ref), this mutates the `Job` object only; call
+[`addJob!`](@ref)`(store, job)` afterwards to write the re-enabled job back to a
+persisting store.
 """
 enable!(job::Job) = @lock job.lock (job.disabledAt = nothing)
 
@@ -274,8 +282,18 @@ end
 
 Create job and execution-history views over one `AbstractStore` backend.
 Namespacing lets Tempus share a physical store with other libraries and
-application state. The backend must accept both `Job` and
-`Vector{JobExecution}` values, such as an `AbstractStore{Any}`.
+application state.
+
+The backend must accept both `Job` and `Vector{JobExecution}` values — i.e. be an
+`AbstractStore{Any}` — and it must return them *as those types*. That rules out
+codecs that decode at the backend's own `eltype`: `FileStore{Any}(dir;
+codec=JSONCodec())` hands back `Dict{String,Any}`, not a `Job`. Use a
+type-preserving backend (`MemoryStore()`, or any store with the default
+`SerializedCodec`), or pass separately typed stores to `Store(jobs, executions)`.
+
+`history_limit` bounds the execution history kept per job. Note that
+`max_executions`/`max_failed_executions` are evaluated against that history, so a
+limit below either of them means the corresponding cap can never be reached.
 """
 function Store(
     backend::AbstractStores.AbstractStore;
@@ -283,6 +301,12 @@ function Store(
     history_limit::Int=100,
 )
     history_limit > 0 || throw(ArgumentError("history_limit must be positive"))
+    (Job <: eltype(backend) && Vector{JobExecution} <: eltype(backend)) || throw(ArgumentError(
+        "a Tempus store needs a backend holding both `Tempus.Job` and " *
+        "`Vector{Tempus.JobExecution}` values, but `eltype(backend)` is $(eltype(backend)). " *
+        "Use an `AbstractStore{Any}` (`MemoryStore()`, `FileStore(dir)`, `SQLStore{Any}(conn)`), " *
+        "or pass separately typed stores to `Tempus.Store(jobs, executions)`."))
+    AbstractStores.checkstore(backend; listing=true)
     return Store(
         AbstractStores.PrefixedStore{Job}(backend, string(prefix, "jobs/")),
         AbstractStores.PrefixedStore{Vector{JobExecution}}(
@@ -304,6 +328,7 @@ function Store(
     history_limit::Int=100,
 )
     history_limit > 0 || throw(ArgumentError("history_limit must be positive"))
+    AbstractStores.checkstore(jobs; listing=true)
     return Store(jobs, executions, history_limit)
 end
 
@@ -332,7 +357,15 @@ function SQLiteStore(connection; table::AbstractString="tempus_state", kw...)
 end
 
 """Return every stored job, regardless of disabled status."""
-getJobs(store::Store) = [store.jobs[name] for name in keys(store.jobs)]
+function getJobs(store::Store)
+    jobs = Job[]
+    for name in keys(store.jobs)
+        # a concurrent `purgeJob!` can remove a key between listing and fetching
+        job = get(store.jobs, name, nothing)
+        job === nothing || push!(jobs, job)
+    end
+    return jobs
+end
 
 """Add or replace a job by name."""
 function addJob!(store::Store, job::Job)
@@ -388,6 +421,10 @@ end
 Prepend one execution to the job history and keep at most `history_limit`
 records. The update is atomic when the selected backend provides atomic
 `modify!`.
+
+A serializing backend encodes the whole `JobExecution`, including the value the
+job returned and any exception it threw, so those must be encodable by the
+backend's codec.
 """
 function storeJobExecution!(store::Store, execution::JobExecution)
     AbstractStores.modify!(store.executions, execution.job.name) do current
@@ -625,8 +662,14 @@ function executeJob!(scheduler::Scheduler, jobExecution::JobExecution)
             jobExecution.finish = Dates.now(UTC)
             scheduler.logging && @info "[$(jobExecution.jobExecutionId)]: Job $(jobExecution.job.name) execution finished at $(jobExecution.finish)"
         end
-        # store the job execution
-        storeJobExecution!(scheduler.store, jobExecution)
+        # store the job execution; a persisting store serializes the execution,
+        # including whatever the job returned or threw, so a value it cannot
+        # encode must not take the scheduler's bookkeeping down with it
+        try
+            storeJobExecution!(scheduler.store, jobExecution)
+        catch e
+            scheduler.logging && @error "[$(jobExecution.jobExecutionId)]: Failed to store execution of job $(jobExecution.job.name); its execution history is now incomplete" exception=(e, catch_backtrace())
+        end
         # run next execution eligibility checks with the latest execution persisted
         next = nextJobExecution(scheduler, jobExecution.job)
         @lock scheduler.lock begin

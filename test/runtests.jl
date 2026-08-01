@@ -468,6 +468,87 @@ end
     @test isempty(Tempus.getNMostRecentJobExecutions(store, job.name, 10))
 end
 
+@testset "Store backend validation" begin
+    # a backend that cannot hold Jobs must fail at construction, not at first use
+    @test_throws ArgumentError Tempus.Store(MemoryStore{String}())
+    @test_throws ArgumentError Tempus.Store(MemoryStore(); history_limit=0)
+end
+
+@testset "Serializing backend persists bounded history" begin
+    mktempdir() do dir
+        job = Tempus.Job(_filestore_test_action, "history_job", "* * * * * *")
+        store = Tempus.FileStore(dir; history_limit=2)
+        Tempus.addJob!(store, job)
+        for second in 1:3
+            je = Tempus.JobExecution(job, DateTime(2024, 1, 1, 0, 0, second))
+            je.actualStart = je.scheduledStart
+            je.finish = je.scheduledStart
+            je.status = :succeeded
+            je.result = nothing
+            je.exception = nothing
+            Tempus.storeJobExecution!(store, je)
+        end
+        # Read through a *fresh* store: nothing is cached in this process, so a
+        # `modify!` callback that mutated the value it was handed (which
+        # AbstractStores reads as "no change", skipping the write) would show up
+        # here as lost appends.
+        reopened = Tempus.FileStore(dir; history_limit=2)
+        history = Tempus.getNMostRecentJobExecutions(reopened, "history_job", 10)
+        @test length(history) == 2
+        @test [je.scheduledStart for je in history] ==
+            [DateTime(2024, 1, 1, 0, 0, 3), DateTime(2024, 1, 1, 0, 0, 2)]
+        @test only(Tempus.getJobs(reopened)).name == "history_job"
+    end
+end
+
+@testset "Persisted jobs reload in a fresh process" begin
+    mktempdir() do dir
+        state = joinpath(dir, "state")     # the store owns this directory
+        sentinel = joinpath(dir, "ran.txt")
+        store = Tempus.FileStore(state)
+        Tempus.addJob!(store,
+            Tempus.Job(_filestore_test_action, "fresh_process_job", "0 * * * * *"))
+        code = """
+        using Tempus
+        _filestore_test_action() = write(raw"$sentinel", "ran")
+        store = Tempus.FileStore(raw"$state")
+        jobs = Tempus.getJobs(store)
+        length(jobs) == 1 || error("expected 1 job, got \$(length(jobs))")
+        job = only(jobs)
+        job.name == "fresh_process_job" || error("wrong job name: \$(job.name)")
+        job.schedule === nothing && error("schedule did not survive persistence")
+        job.action()
+        """
+        run(`$(Base.julia_cmd()) --project=$(Base.active_project()) -e $code`)
+        @test isfile(sentinel)
+    end
+end
+
+@testset "Unstorable execution does not wedge the scheduler" begin
+    mktempdir() do dir
+        runs = Ref(0)
+        job = Tempus.Job("unstorable_result", "* * * * * *") do
+            runs[] += 1
+            # a *running* Task cannot be serialized, so persisting this
+            # execution throws inside the execution task
+            return Threads.@spawn (sleep(30); nothing)
+        end
+        scheduler = Tempus.Scheduler(Tempus.FileStore(dir); logging=false)
+        try
+            Tempus.run!(scheduler)
+            push!(scheduler, job)
+            sleep(3.5)
+            @test runs[] > 1                                    # still scheduling
+            @test isempty(scheduler.executingJobExecutions)     # bookkeeping intact
+        finally
+            # stop the loop without waiting: if this regression ever comes back,
+            # `close` blocks on executions that never finished bookkeeping, and a
+            # hung test is worse than a failed one
+            @lock scheduler.lock (scheduler.running = false)
+        end
+    end
+end
+
 @testset "Scheduler simultaneous-ready regression" begin
     runs = Ref(0)
     store = Tempus.InMemoryStore()
