@@ -9,15 +9,12 @@ JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
 TimeZones = "f269a46b-ccf7-5d73-abea-4c690281aa53"
 
-[sources]
-AbstractStores = {url = "https://github.com/JuliaServices/AbstractStores.jl.git", rev = "4900d65ab7a370ef770b8fe0759d19635842f64c"}
-
 [compat]
 AbstractStores = "0.1"
 JSON = "1"
 SQLite = "1"
 TimeZones = "1"
-julia = "1.9"
+julia = "1.10"
 
 [extras]
 SQLite = "0aa819cd-b072-5ff4-a722-6bc24af294d9"

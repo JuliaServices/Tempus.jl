@@ -30,18 +30,15 @@ jobs:
         with:
           version: ${{ matrix.version }}
           arch: ${{ matrix.arch }}
-      # The minimum supported Julia predates Project.toml [sources]. Remove this
-      # bootstrap after AbstractStores is registered in General.
-      - name: Add AbstractStores on minimum Julia
-        if: ${{ matrix.version == 'min' }}
+      - uses: julia-actions/cache@v2
+      # TEMPORARY: AbstractStores.jl is not in the General registry yet, so it
+      # cannot be resolved from Project.toml's [deps] alone. Delete this whole
+      # step once AbstractStores is registered; nothing else needs to change.
+      - name: Install unregistered AbstractStores
         shell: julia --color=yes --project=. {0}
         run: |
           using Pkg
-          Pkg.add(PackageSpec(
-            url = "https://github.com/JuliaServices/AbstractStores.jl.git",
-            rev = "4900d65ab7a370ef770b8fe0759d19635842f64c",
-          ))
-      - uses: julia-actions/cache@v2
+          Pkg.add(PackageSpec(url = "https://github.com/JuliaServices/AbstractStores.jl.git"))
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
       - uses: julia-actions/julia-processcoverage@v1
