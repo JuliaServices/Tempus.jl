@@ -31,14 +31,6 @@ jobs:
           version: ${{ matrix.version }}
           arch: ${{ matrix.arch }}
       - uses: julia-actions/cache@v2
-      # TEMPORARY: AbstractStores.jl is not in the General registry yet, so it
-      # cannot be resolved from Project.toml's [deps] alone. Delete this whole
-      # step once AbstractStores is registered; nothing else needs to change.
-      - name: Install unregistered AbstractStores
-        shell: julia --color=yes --project=. {0}
-        run: |
-          using Pkg
-          Pkg.add(PackageSpec(url = "https://github.com/JuliaServices/AbstractStores.jl.git"))
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
       - uses: julia-actions/julia-processcoverage@v1
