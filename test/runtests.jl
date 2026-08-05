@@ -1,8 +1,8 @@
-using Test, Dates, JSON, SQLite, Tempus
+using Test, AbstractStores, Dates, JSON, SQLite, Tempus
 
 import Tempus: parseCronField, parseCron, getnext
 
-# Named function for FileStore persistence test (anonymous functions can't be persisted)
+# A named function remains resolvable when a persistent store is reopened.
 _filestore_test_action() = (global executed; push!(executed, Dates.now(UTC)))
 _sqlite_test_action() = nothing
 
@@ -407,9 +407,9 @@ executed = DateTime[]
 
     # if job is disabled, it persists through scheduler restart
 
-    # simple FileStore (requires named function for persistence)
+    # FileStore uses a directory and persists both jobs and execution history.
     empty!(executed)
-    mktemp() do path, io
+    mktempdir() do path
         fs_job = Tempus.Job(_filestore_test_action, "testjob_fs", "* * * * * *")
         fs = Tempus.FileStore(path)
         withscheduler(fs) do sch
@@ -417,14 +417,135 @@ executed = DateTime[]
             sleep(3)
         end
         @test length(executed) > 0
-        # now run again, checking that our job was successfully persisted in the file
+        @test !isempty(
+            Tempus.getNMostRecentJobExecutions(fs, "testjob_fs", 10),
+        )
+
+        # Reopen the same backend and verify both forms of state survived.
         empty!(executed)
         fs = Tempus.FileStore(path)
+        @test !isempty(
+            Tempus.getNMostRecentJobExecutions(fs, "testjob_fs", 10),
+        )
         withscheduler(fs) do sch
             sleep(3)
         end
-        @show executed
         @test length(executed) > 0
+    end
+end
+
+@testset "AbstractStores-backed state" begin
+    backend = MemoryStore()
+    store = Tempus.Store(backend; prefix="scheduler/", history_limit=2)
+    job = Tempus.Job(() -> nothing, "bounded", "* * * * * *")
+    Tempus.addJob!(store, job)
+    @test collect(keys(backend; prefix="scheduler/jobs/")) ==
+        ["scheduler/jobs/bounded"]
+
+    for second in 1:3
+        execution = Tempus.JobExecution(
+            job,
+            DateTime(2024, 1, 1, 0, 0, second),
+        )
+        execution.actualStart = execution.scheduledStart
+        execution.finish = execution.scheduledStart
+        execution.status = :succeeded
+        execution.result = nothing
+        execution.exception = nothing
+        Tempus.storeJobExecution!(store, execution)
+    end
+    history = Tempus.getNMostRecentJobExecutions(store, job.name, 10)
+    @test length(history) == 2
+    @test history[1].scheduledStart == DateTime(2024, 1, 1, 0, 0, 3)
+
+    disabled_at = DateTime(2024, 1, 2)
+    Tempus.disableJob!(store, job; at=disabled_at)
+    @test only(Tempus.getJobs(store)).disabledAt == disabled_at
+    @test job.disabledAt == disabled_at
+
+    Tempus.purgeJob!(store, job.name)
+    @test isempty(Tempus.getJobs(store))
+    @test isempty(Tempus.getNMostRecentJobExecutions(store, job.name, 10))
+end
+
+@testset "Store backend validation" begin
+    # a backend that cannot hold Jobs must fail at construction, not at first use
+    @test_throws ArgumentError Tempus.Store(MemoryStore{String}())
+    @test_throws ArgumentError Tempus.Store(MemoryStore(); history_limit=0)
+end
+
+@testset "Serializing backend persists bounded history" begin
+    mktempdir() do dir
+        job = Tempus.Job(_filestore_test_action, "history_job", "* * * * * *")
+        store = Tempus.FileStore(dir; history_limit=2)
+        Tempus.addJob!(store, job)
+        for second in 1:3
+            je = Tempus.JobExecution(job, DateTime(2024, 1, 1, 0, 0, second))
+            je.actualStart = je.scheduledStart
+            je.finish = je.scheduledStart
+            je.status = :succeeded
+            je.result = nothing
+            je.exception = nothing
+            Tempus.storeJobExecution!(store, je)
+        end
+        # Read through a *fresh* store: nothing is cached in this process, so a
+        # `modify!` callback that mutated the value it was handed (which
+        # AbstractStores reads as "no change", skipping the write) would show up
+        # here as lost appends.
+        reopened = Tempus.FileStore(dir; history_limit=2)
+        history = Tempus.getNMostRecentJobExecutions(reopened, "history_job", 10)
+        @test length(history) == 2
+        @test [je.scheduledStart for je in history] ==
+            [DateTime(2024, 1, 1, 0, 0, 3), DateTime(2024, 1, 1, 0, 0, 2)]
+        @test only(Tempus.getJobs(reopened)).name == "history_job"
+    end
+end
+
+@testset "Persisted jobs reload in a fresh process" begin
+    mktempdir() do dir
+        state = joinpath(dir, "state")     # the store owns this directory
+        sentinel = joinpath(dir, "ran.txt")
+        store = Tempus.FileStore(state)
+        Tempus.addJob!(store,
+            Tempus.Job(_filestore_test_action, "fresh_process_job", "0 * * * * *"))
+        code = """
+        using Tempus
+        _filestore_test_action() = write(raw"$sentinel", "ran")
+        store = Tempus.FileStore(raw"$state")
+        jobs = Tempus.getJobs(store)
+        length(jobs) == 1 || error("expected 1 job, got \$(length(jobs))")
+        job = only(jobs)
+        job.name == "fresh_process_job" || error("wrong job name: \$(job.name)")
+        job.schedule === nothing && error("schedule did not survive persistence")
+        job.action()
+        """
+        run(`$(Base.julia_cmd()) --project=$(Base.active_project()) -e $code`)
+        @test isfile(sentinel)
+    end
+end
+
+@testset "Unstorable execution does not wedge the scheduler" begin
+    mktempdir() do dir
+        runs = Ref(0)
+        job = Tempus.Job("unstorable_result", "* * * * * *") do
+            runs[] += 1
+            # a *running* Task cannot be serialized, so persisting this
+            # execution throws inside the execution task
+            return Threads.@spawn (sleep(30); nothing)
+        end
+        scheduler = Tempus.Scheduler(Tempus.FileStore(dir); logging=false)
+        try
+            Tempus.run!(scheduler)
+            push!(scheduler, job)
+            sleep(3.5)
+            @test runs[] > 1                                    # still scheduling
+            @test isempty(scheduler.executingJobExecutions)     # bookkeeping intact
+        finally
+            # stop the loop without waiting: if this regression ever comes back,
+            # `close` blocks on executions that never finished bookkeeping, and a
+            # hung test is worse than a failed one
+            @lock scheduler.lock (scheduler.running = false)
+        end
     end
 end
 
