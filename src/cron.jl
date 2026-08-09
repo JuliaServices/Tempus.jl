@@ -196,110 +196,87 @@ end
 
 const ANY_CRON = Cron(Wildcard(), Wildcard(), Wildcard(), Wildcard(), Wildcard(), Wildcard())
 
+# how far ahead getnext searches before concluding the expression can never fire
+# (e.g. "0 0 30 2 *"); 10 years covers the worst gap between matches of any
+# satisfiable expression, the 8 years between Feb 29ths around a non-leap
+# century year
+const MAX_LOOKAHEAD = Dates.Year(10)
+
 # Compute the next trigger time after 'from'
+#
+# Each field is checked most-significant first; when a field doesn't match, time
+# either jumps directly to the field's next allowed value (with all lesser
+# fields reset to their minimums) or, when the field has to wrap, rolls over
+# into the next larger unit via period arithmetic and re-enters the loop. All
+# date construction is either period arithmetic or uses values already known to
+# be valid, so carries at month/day/hour boundaries can't produce out-of-range
+# `DateTime` arguments. Days advance one at a time because day-of-month,
+# day-of-week, and month lengths interact; the month check above fast-forwards
+# over months that can't match.
 function getnext(cron::Cron, from::DateTime=Dates.now(UTC))
     minSeconds = minimumallowed(Second, cron.second)
     minMinutes = minimumallowed(Minute, cron.minute)
-    minHours = minimumallowed(Hour, cron.hour)
-    minDays = minimumallowed(Day, cron.day_of_month)
-    next = from + Dates.Second(1)
+    limit = from + MAX_LOOKAHEAD
+    next = trunc(from, Second) + Second(1)
     while true
+        next > limit && throw(ArgumentError("cron expression $cron does not fire within $MAX_LOOKAHEAD of $from"))
         # check month
         curMonth = Month(next)
         if !allowed(curMonth, cron.month)
-            # find next allowed month
             nextMonth = nextallowed(curMonth, cron.month)
-            if nextMonth <= curMonth
-                # if the next allowed month is less than the current month, we need to advance to the next year
-                # then we want to use the minimum allowed month, day, hour, minute, and second
-                next = DateTime(Year(next) + Year(1), nextMonth, minDays, minHours, minMinutes, minSeconds)
-            elseif nextMonth > curMonth
-                # if the next allowed month is greater than the current month, we need to reset
-                # the day, hour, minute, and second to the minimum allowed values
-                next = DateTime(Year(next), nextMonth, minDays, minHours, minMinutes, minSeconds)
-            end
+            # a next allowed month at or before the current one means we wrapped
+            # into the next year; either way restart at the first day of that
+            # month and let the checks below advance day/hour/minute/second
+            y = nextMonth <= curMonth ? Year(next) + Year(1) : Year(next)
+            next = DateTime(y, nextMonth, Day(1), Hour(0), Minute(0), Second(0))
             continue
         end
-        # check day
+        # check day: when both day-of-month and day-of-week are restricted, a
+        # day matching either one is allowed (standard cron semantics)
         curDay = Day(next)
-        curDayOfWeek = DayOfWeek(dayofweek(next))
+        # cron numbers days 0=Sunday..6=Saturday; Dates.dayofweek gives 1=Monday..7=Sunday
+        curDayOfWeek = DayOfWeek(dayofweek(next) % 7)
         if !allowed(curDay, cron.day_of_month, curDayOfWeek, cron.day_of_week)
-            # find next allowed day
-            nextDay = nextallowed(curDay, cron.day_of_month)
-            if nextDay <= curDay
-                # if the next allowed day is less than the current day, we need to advance to the next month
-                # then we want to use the minimum allowed day, hour, minute, and second
-                nextDayDate = DateTime(Year(next), Month(next) + Month(1), nextDay, minHours, minMinutes, minSeconds)
-            elseif nextDay > curDay
-                # if the next allowed day is greater than the current day, we need to reset
-                # the hour, minute, and second to the minimum allowed values
-                nextDayDate = DateTime(Year(next), Month(next), nextDay, minHours, minMinutes, minSeconds)
-            end
-            nextDayOfWeek = nextallowed(curDayOfWeek, cron.day_of_week)
-            if nextDayOfWeek <= curDayOfWeek
-                # if the next allowed day of week is less than the current day of week, we need to advance to the next week
-                # then we want to use the minimum allowed day of week, hour, minute, and second
-                nextDayOfWeekDate = next + Dates.Day(7 - curDayOfWeek.value + nextDayOfWeek.value)
-                nextDayOfWeekDate = DateTime(Year(nextDayOfWeekDate), Month(nextDayOfWeekDate), Day(nextDayOfWeekDate), minHours, minMinutes, minSeconds)
-            elseif nextDayOfWeek > curDayOfWeek
-                # if the next allowed day of week is greater than the current day of week, we need to reset
-                # the hour, minute, and second to the minimum allowed values
-                nextdayOfWeekDate = next + Dates.Day(nextDayOfWeek.value - curDayOfWeek.value)
-                nextDayOfWeekDate = DateTime(Year(nextDayOfWeekDate), Month(nextDayOfWeekDate), Day(nextDayOfWeekDate), minHours, minMinutes, minSeconds)
-            end
-            next = min(nextDayDate, nextDayOfWeekDate)
+            next = DateTime(Date(next) + Dates.Day(1))
             continue
         end
         # check hour
         curHour = Hour(next)
         if !allowed(curHour, cron.hour)
-            # find next allowed hour
             nextHour = nextallowed(curHour, cron.hour)
             if nextHour <= curHour
-                # if the next allowed hour is less than the current hour, we need to advance to the next day
-                # then we want to use the minimum allowed hour, minute, and second
-                next = DateTime(Year(next), Month(next), Day(next) + Day(1), nextHour, minMinutes, minSeconds)
-            elseif nextHour > curHour
-                # if the next allowed hour is greater than the current hour, we need to reset
-                # the minute and second to the minimum allowed values
-                next = DateTime(Year(next), Month(next), Day(next), nextHour, minMinutes, minSeconds)
+                # wraps into the next day, which must be revalidated against the
+                # date fields above
+                next = DateTime(Date(next) + Dates.Day(1))
+            else
+                next = DateTime(Year(next), Month(next), curDay, nextHour, minMinutes, minSeconds)
             end
             continue
         end
         # check minute
         curMinute = Minute(next)
         if !allowed(curMinute, cron.minute)
-            # find next allowed minute
             nextMinute = nextallowed(curMinute, cron.minute)
             if nextMinute <= curMinute
-                # if the next allowed minute is less than the current minute, we need to advance to the next hour
-                # then we want to use the minimum allowed minute and second
-                next = DateTime(Year(next), Month(next), Day(next), Hour(next) + Hour(1), nextMinute, minSeconds)
-            elseif nextMinute > curMinute
-                # if the next allowed minute is greater than the current minute, we need to reset
-                # the second to the minimum allowed second
-                next = DateTime(Year(next), Month(next), Day(next), Hour(next), nextMinute, minSeconds)
+                next = trunc(next, Hour) + Hour(1)
+            else
+                next = DateTime(Year(next), Month(next), curDay, curHour, nextMinute, minSeconds)
             end
             continue
         end
         # check second
         curSecond = Second(next)
         if !allowed(curSecond, cron.second)
-            # find next allowed second
             nextSecond = nextallowed(curSecond, cron.second)
             if nextSecond <= curSecond
-                # if the next allowed second is less than the current second, we need to advance to the next minute
-                # then we want to use the minimum allowed second
-                next = DateTime(Year(next), Month(next), Day(next), Hour(next), Minute(next) + Minute(1), nextSecond)
-            elseif nextSecond > curSecond
-                # if the next allowed second is greater than the current second, we need to reset
-                # the second to the minimum allowed second
-                next = DateTime(Year(next), Month(next), Day(next), Hour(next), Minute(next), nextSecond)
+                next = trunc(next, Minute) + Minute(1)
+            else
+                next = DateTime(Year(next), Month(next), curDay, curHour, curMinute, nextSecond)
             end
             continue
         end
         # all fields are now valid/allowed, return
-        return trunc(next, Second)
+        return next
     end
 end
 

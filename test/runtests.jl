@@ -689,3 +689,20 @@ end
     @test parsed["msg"] == "hello"
     @test job.action(; parsed...) == "hello"
 end
+
+@testset "getnext rollover regressions" begin
+    # every one of these threw an out-of-range ArgumentError, hit an
+    # UndefVarError, or looped forever before the rollover rewrite
+    @test getnext(parseCron("* * * * 0"), DateTime(2021, 1, 2)) == DateTime(2021, 1, 3)  # Sunday never matched dayofweek() == 7
+    @test getnext(parseCron("0 * * * * 0"), DateTime(2021, 1, 3, 10, 30, 0)) == DateTime(2021, 1, 3, 10, 31, 0)
+    @test getnext(parseCron("* * * * 2"), DateTime(2021, 1, 4)) == DateTime(2021, 1, 5)  # UndefVarError branch (advancing to a later weekday)
+    @test getnext(parseCron("0 0 30 * *"), DateTime(2021, 2, 5)) == DateTime(2021, 3, 30)  # "Day: 30 out of range" for February
+    @test getnext(parseCron("0 0 15 * *"), DateTime(2021, 12, 20)) == DateTime(2022, 1, 15)  # "Month: 13 out of range"
+    @test getnext(parseCron("* * * * 2"), DateTime(2021, 1, 30)) == DateTime(2021, 2, 2)  # invalid date via the day-of-week path
+    @test getnext(parseCron("0 0 12 * * *"), DateTime(2021, 1, 31, 13, 0, 0)) == DateTime(2021, 2, 1, 12, 0, 0)  # "Day: 32 out of range"
+    @test getnext(parseCron("30 * * * *"), DateTime(2021, 1, 15, 23, 45, 0)) == DateTime(2021, 1, 16, 0, 30, 0)  # "Hour: 24 out of range"
+    @test getnext(parseCron("30 * * * * *"), DateTime(2021, 1, 15, 23, 59, 45)) == DateTime(2021, 1, 16, 0, 0, 30)  # "Minute: 60 out of range"
+    @test getnext(parseCron("0 0 29 2 *"), DateTime(2021, 3, 1)) == DateTime(2024, 2, 29)  # multi-year day search
+    # an expression that can never fire is a bounded error, not an infinite loop
+    @test_throws ArgumentError getnext(parseCron("0 0 30 2 *"), DateTime(2021, 1, 1))
+end
