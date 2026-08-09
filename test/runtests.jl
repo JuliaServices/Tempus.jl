@@ -815,3 +815,14 @@ end
     @test count(je -> je.job.name == "repush", scheduler.jobExecutions) == 1
     close(scheduler; timeout=2)
 end
+
+@testset "Failed execution is showable" begin
+    store = Tempus.InMemoryStore()
+    job = Tempus.OneShotJob(() -> error("x"), "showable_failure"; retries=0)
+    Tempus.runJobs!(store, [job]; retries=0, max_failed_executions=1, logging=false)
+    history = Tempus.getNMostRecentJobExecutions(store, "showable_failure", 5)
+    @test !isempty(history)
+    @test history[1].status == :failed
+    @test history[1].result === nothing  # was left #undef, so show() threw UndefRefError
+    @test sprint(show, history[1]) isa String
+end

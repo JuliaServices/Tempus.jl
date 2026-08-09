@@ -694,6 +694,7 @@ function executeJob!(scheduler::Scheduler, jobExecution::JobExecution)
             jobExecution.status = :succeeded
             jobExecution.exception = nothing
         catch e
+            jobExecution.result = nothing
             jobExecution.exception = e
             jobExecution.status = :failed
             scheduler.logging && @error "[$(jobExecution.jobExecutionId)]: Job $(jobExecution.job.name) execution failed" exception=(e, catch_backtrace())
