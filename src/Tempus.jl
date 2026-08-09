@@ -529,7 +529,10 @@ function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
             now = trunc(Dates.now(UTC), Second)
             @lock scheduler.lock begin
                 scheduler.running || break
-                if isempty(scheduler.jobExecutions) && close_when_no_jobs
+                if close_when_no_jobs && isempty(scheduler.jobExecutions) && isempty(scheduler.executingJobExecutions)
+                    # in-flight executions count: a finishing one-shot may still
+                    # schedule a retry, and waiting also lets `wait(scheduler)`
+                    # callers observe every execution's completion
                     scheduler.logging && @info "No jobs left to execute, closing scheduler."
                     break
                 end
@@ -614,6 +617,10 @@ function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
             end
         end
         @lock scheduler.lock begin
+            # the loop is the scheduler's liveness; whichever way it exits, the
+            # scheduler is no longer running and finishing executions must be
+            # able to observe that (otherwise `wait(scheduler)` never returns)
+            scheduler.running = false
             isempty(scheduler.executingJobExecutions) && notify(scheduler.jobExecutionFinished)
         end
     end)

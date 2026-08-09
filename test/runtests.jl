@@ -763,3 +763,14 @@ end
     close(scheduler; timeout=2)
     @test time() - t0 < 30
 end
+
+@testset "runJobs! waits for in-flight executions" begin
+    # with close_when_no_jobs, the scheduler loop used to break as soon as the
+    # queue was empty even though an execution was still running — and since
+    # only close() cleared scheduler.running, the finishing execution never
+    # notified jobExecutionFinished and wait(scheduler) hung forever
+    runs = Ref(0)
+    slow = Tempus.OneShotJob(() -> (sleep(2); runs[] += 1), "slow_oneshot_wait")
+    Tempus.runJobs!(Tempus.InMemoryStore(), [slow]; logging=false)
+    @test runs[] == 1
+end
