@@ -696,14 +696,18 @@ function Base.close(scheduler::Scheduler; timeout::Real=5)
         scheduler.running = false
     end
     # we use a Timer here to notify jobExecutionFinished ourself if the scheduler
-    # or last executing job doesn't do it themselves in time
-    Timer(timeout) do t
-        if isopen(t)
-            scheduler.logging && @warn "Scheduler closing timeout reached, returning without waiting for job executions to finish."
-            notify(scheduler.jobExecutionFinished)
-        end
+    # or last executing job doesn't do it themselves in time (note a one-shot
+    # Timer is already closed inside its own callback, so the callback must not
+    # be guarded by isopen; cancellation is handled by close(timer) below)
+    timer = Timer(timeout) do t
+        scheduler.logging && @warn "Scheduler closing timeout reached, returning without waiting for job executions to finish."
+        notify(scheduler.jobExecutionFinished)
     end
-    wait(scheduler.jobExecutionFinished)
+    try
+        wait(scheduler.jobExecutionFinished)
+    finally
+        close(timer)
+    end
     scheduler.logging && @info "Scheduler closed and job execution stopped."
     return
 end

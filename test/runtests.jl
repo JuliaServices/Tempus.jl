@@ -749,3 +749,17 @@ end
     @test_throws ArgumentError parseCron("0 0 * * FRI-MON")
     @test_throws ArgumentError parseCron("* * * * 8")
 end
+
+@testset "close timeout failsafe" begin
+    # a job that outlives the close timeout must not block close forever: the
+    # old timer callback was guarded by isopen(t), which is already false
+    # inside an expired one-shot Timer's callback, so the failsafe never fired
+    hung = Tempus.OneShotJob(() -> sleep(60), "hung_close_job")
+    scheduler = Tempus.Scheduler(; logging=false)
+    Tempus.run!(scheduler)
+    push!(scheduler, hung)
+    sleep(1.5)  # let the execution start
+    t0 = time()
+    close(scheduler; timeout=2)
+    @test time() - t0 < 30
+end
