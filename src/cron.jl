@@ -165,16 +165,72 @@ function parseCronField(field)
     throw(ArgumentError("Invalid cron field: $field"))
 end
 
-function parseCron(cron::String)
-    parts = split(cron, " ")
+# @reboot has no equivalent here; jobs run on a schedule, not at scheduler start
+const CRON_ALIASES = Dict(
+    "@yearly"   => "0 0 1 1 *",
+    "@annually" => "0 0 1 1 *",
+    "@monthly"  => "0 0 1 * *",
+    "@weekly"   => "0 0 * * 0",
+    "@daily"    => "0 0 * * *",
+    "@midnight" => "0 0 * * *",
+    "@hourly"   => "0 * * * *",
+)
+
+const MONTH_NAMES = Dict(
+    "JAN" => 1, "FEB" => 2, "MAR" => 3, "APR" => 4, "MAY" => 5, "JUN" => 6,
+    "JUL" => 7, "AUG" => 8, "SEP" => 9, "OCT" => 10, "NOV" => 11, "DEC" => 12,
+)
+
+const DAY_NAMES = Dict(
+    "SUN" => 0, "MON" => 1, "TUE" => 2, "WED" => 3, "THU" => 4, "FRI" => 5, "SAT" => 6,
+)
+
+# replace three-letter month/day names (case-insensitive) with their numeric values
+function substitutenames(field::AbstractString, names::Dict{String, Int})
+    return replace(field, r"[A-Za-z]+" => name -> begin
+        value = get(names, uppercase(name), nothing)
+        value === nothing && throw(ArgumentError("Invalid name \"$name\" in cron field: $field"))
+        string(value)
+    end)
+end
+
+# cron also numbers Sunday as 7; rewrite day-of-week fields so matching only
+# ever sees 0. Ranges and steps reaching 7 become explicit value lists because
+# wrapping 7 to 0 breaks their contiguity.
+normalizedow(x::CronField) = x
+normalizedow(x::Numeric) = x.value == 7 ? Numeric(0) : x
+normalizedow(x::List) = 7 in x.values ? List(unique!(replace(x.values, 7 => 0))) : x
+function normalizedow(x::Range)
+    x.stop == 7 || return x
+    x.start == 0 && return Range(0, 6)
+    x.start == 7 && return Numeric(0)
+    return List(unique!([0; x.start:6]))
+end
+function normalizedow(x::Step)
+    (x.range isa Range && x.range.stop == 7 && x.step >= 1) || return x
+    return List(unique!([v == 7 ? 0 : v for v in x.range.start:x.step:7]))
+end
+
+function parseCron(cron::AbstractString)
+    expr = strip(cron)
+    if startswith(expr, '@')
+        expr = get(CRON_ALIASES, lowercase(expr), nothing)
+        expr === nothing && throw(ArgumentError("Unknown cron alias: $cron"))
+    end
+    parts = split(expr)
     if length(parts) == 5
-        minute, hour, day, month, day_of_week = map(parseCronField, parts)
+        minute, hour, day = map(parseCronField, parts[1:3])
+        month = parseCronField(substitutenames(parts[4], MONTH_NAMES))
+        day_of_week = parseCronField(substitutenames(parts[5], DAY_NAMES))
         second = Numeric(0)
     elseif length(parts) == 6
-        second, minute, hour, day, month, day_of_week = map(parseCronField, parts)
+        second, minute, hour, day = map(parseCronField, parts[1:4])
+        month = parseCronField(substitutenames(parts[5], MONTH_NAMES))
+        day_of_week = parseCronField(substitutenames(parts[6], DAY_NAMES))
     else
         throw(ArgumentError("Invalid cron expression: $cron"))
     end
+    day_of_week = normalizedow(day_of_week)
     # validate cron fields (seconds in range 0-59, minutes in range 0-59, hours in range 0-23, day of month in range 1-31, month in range 1-12, day of week in range 0-6)
     if !valid(Second, second)
         throw(ArgumentError("Invalid seconds value: $second"))

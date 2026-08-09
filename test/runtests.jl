@@ -726,3 +726,26 @@ end
     # wildcard steps are unchanged: */15 still means 0,15,30,45
     @test getnext(parseCron("*/15 * * * *"), DateTime(2021, 1, 1, 0, 12, 0)) == DateTime(2021, 1, 1, 0, 15, 0)
 end
+
+@testset "Cron parsing extensions" begin
+    # 7 is Sunday, same as 0 (standard cron accepts both)
+    @test getnext(parseCron("* * * * 7"), DateTime(2021, 1, 2)) == DateTime(2021, 1, 3)
+    @test getnext(parseCron("0 0 0 * * 5-7"), DateTime(2021, 1, 9)) == DateTime(2021, 1, 10)   # Sat -> Sun via a range through 7
+    @test getnext(parseCron("0 0 0 * * 5-7"), DateTime(2021, 1, 4)) == DateTime(2021, 1, 8)    # Mon -> Fri
+    # month and day-of-week names, case-insensitive
+    @test getnext(parseCron("0 0 * * MON-FRI"), DateTime(2021, 1, 2)) == DateTime(2021, 1, 4)
+    @test getnext(parseCron("0 0 1 JAN *"), DateTime(2021, 3, 1)) == DateTime(2022, 1, 1)
+    @test getnext(parseCron("0 0 * * sun"), DateTime(2021, 1, 4)) == DateTime(2021, 1, 10)
+    # @-aliases
+    @test getnext(parseCron("@daily"), DateTime(2021, 1, 1, 5, 0, 0)) == DateTime(2021, 1, 2)
+    @test getnext(parseCron("@hourly"), DateTime(2021, 1, 1, 5, 30, 0)) == DateTime(2021, 1, 1, 6, 0, 0)
+    @test getnext(parseCron("@weekly"), DateTime(2021, 1, 4)) == DateTime(2021, 1, 10)
+    @test getnext(parseCron("@monthly"), DateTime(2021, 1, 4)) == DateTime(2021, 2, 1)
+    @test getnext(parseCron("@yearly"), DateTime(2021, 1, 4)) == DateTime(2022, 1, 1)
+    # whitespace runs and surrounding whitespace are tolerated
+    @test getnext(parseCron("  0  0 * * *\t"), DateTime(2021, 1, 1, 5, 0, 0)) == DateTime(2021, 1, 2)
+    @test_throws ArgumentError parseCron("@reboot")
+    @test_throws ArgumentError parseCron("0 0 * * MONDAY-FRI")
+    @test_throws ArgumentError parseCron("0 0 * * FRI-MON")
+    @test_throws ArgumentError parseCron("* * * * 8")
+end
