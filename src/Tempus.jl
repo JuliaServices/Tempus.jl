@@ -545,7 +545,7 @@ function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
         sort!(scheduler.jobExecutions, by=je->je.scheduledStart)
     end
     # start scheduler job execution task
-    errormonitor(Threads.@spawn :interactive begin
+    errormonitor(Threads.@spawn :interactive try
         readyToExecute = Tuple{Int, Bool, JobExecution}[]
         while true
             empty!(readyToExecute)
@@ -641,10 +641,12 @@ function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
                 sleep(0.5)
             end
         end
+    finally
+        # the loop is the scheduler's liveness; however it exits — including a
+        # store error thrown mid-iteration — the scheduler is no longer running
+        # and finishing executions must be able to observe that (otherwise
+        # `wait(scheduler)` never returns)
         @lock scheduler.lock begin
-            # the loop is the scheduler's liveness; whichever way it exits, the
-            # scheduler is no longer running and finishing executions must be
-            # able to observe that (otherwise `wait(scheduler)` never returns)
             scheduler.running = false
             isempty(scheduler.executingJobExecutions) && notify(scheduler.jobExecutionFinished)
         end
@@ -736,18 +738,25 @@ function executeJob!(scheduler::Scheduler, jobExecution::JobExecution)
         # run next execution eligibility checks with the latest execution persisted
         @lock scheduler.lock begin
             delete!(scheduler.executingJobExecutions, jobExecution)
-            if jobExecution.job.schedule === nothing
-                # one-shot jobs schedule a follow-up attempt (nothing when the
-                # execution history now disqualifies the job) only after the
-                # in-flight execution has finished and been recorded
-                next = scheduleNextExecution!(scheduler, jobExecution.job)
-                next === nothing || sort!(scheduler.jobExecutions, by=je->je.scheduledStart)
-            else
-                next = nextJobExecution(scheduler, jobExecution.job)
-            end
-            if next === nothing
-                # if the job should not be scheduled again, drop any queued executions for it
-                filter!(je -> je.job.name != jobExecution.job.name, scheduler.jobExecutions)
+            try
+                if jobExecution.job.schedule === nothing
+                    # one-shot jobs schedule a follow-up attempt (nothing when
+                    # the execution history now disqualifies the job) only after
+                    # the in-flight execution has finished and been recorded
+                    next = scheduleNextExecution!(scheduler, jobExecution.job)
+                    next === nothing || sort!(scheduler.jobExecutions, by=je->je.scheduledStart)
+                else
+                    next = nextJobExecution(scheduler, jobExecution.job)
+                end
+                if next === nothing
+                    # if the job should not be scheduled again, drop any queued executions for it
+                    filter!(je -> je.job.name != jobExecution.job.name, scheduler.jobExecutions)
+                end
+            catch e
+                # a store error here must not skip the notify below (that would
+                # hang wait/close); leave queued executions alone — the job's
+                # eligibility is re-checked at every dispatch anyway
+                scheduler.logging && @error "[$(jobExecution.jobExecutionId)]: Failed to determine job $(jobExecution.job.name)'s next execution" exception=(e, catch_backtrace())
             end
             !scheduler.running && isempty(scheduler.executingJobExecutions) && notify(scheduler.jobExecutionFinished)
         end
