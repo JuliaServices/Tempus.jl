@@ -35,7 +35,7 @@ valid(::Type{P}, ::Wildcard) where {P <: Period} = true
 nextallowed(p::Period, ::Wildcard) = p
 
 ## Returns the minimum allowed value for different period types based on a wildcard definition
-minimumallowed(::Type{P}, ::Wildcard) where {P <: Union{Second, Minute, Hour}} = P(0)
+minimumallowed(::Type{P}, ::Wildcard) where {P <: Union{Second, Minute, Hour, DayOfWeek}} = P(0)
 minimumallowed(::Type{P}, ::Wildcard) where {P <: Union{Day, Month}} = P(1)
 
 ## Represents a numeric value in a cron expression
@@ -81,7 +81,8 @@ end
 minimumallowed(::Type{P}, x::List) where {P <: Period} = P(x.values[1])
 valid(::Type{P}, x::List) where {P <: Period} = all(P(v) in allowedrange(P) for v in x.values)
 
-## Represents a stepped range (e.g., `*/5` or `1-10/2`
+## Represents a stepped range (e.g., `*/5` or `1-10/2`): the allowed values are
+## the range start, start+step, start+2step, ... within the range (standard cron)
 struct Step <: CronField
     range::Union{Range, Wildcard}
     step::Int
@@ -89,17 +90,19 @@ end
 
 Base.show(io::IO, x::Step) = print(io, x.range isa Wildcard ? "*" : "$(x.range.start)-$(x.range.stop)", "/", x.step)
 
-allowed(p::P, x::Step) where {P <: Period} = allowed(p, x.range) && p % P(x.step) == P(0)
+allowed(p::P, x::Step) where {P <: Period} =
+    allowed(p, x.range) && (p - minimumallowed(P, x.range)) % P(x.step) == P(0)
 function nextallowed(p::P, x::Step) where {P <: Period}
-    # if p is already a multiple of the step, return p
-    p % P(x.step) == P(0) && return p
-    # otherwise, find the next multiple of the step
-    v = p + P(P(x.step) - p % P(x.step))
-    # if the next multiple is greater than the maximum allowed value, return the minimum allowed value
-    return allowed(v, x.range) ? v : minimumallowed(P, x.range)
+    start = minimumallowed(P, x.range)
+    p <= start && return start
+    # the smallest on-step value >= p, or the start (signaling a wrap to the
+    # caller) when that overshoots the range
+    offset = (p - start) % P(x.step)
+    v = offset == P(0) ? p : p + (P(x.step) - offset)
+    return allowed(v, x) ? v : start
 end
 minimumallowed(::Type{P}, x::Step) where {P <: Period} = minimumallowed(P, x.range)
-valid(::Type{P}, x::Step) where {P <: Period} = valid(P, x.range) && P(x.step) in allowedrange(P)
+valid(::Type{P}, x::Step) where {P <: Period} = x.step >= 1 && valid(P, x.range) && P(x.step) in allowedrange(P)
 
 ## Represents a parsed cron expression with individual fields for each unit of time
 struct Cron{S, M, H, D, Mo, DoW}

@@ -706,3 +706,23 @@ end
     # an expression that can never fire is a bounded error, not an infinite loop
     @test_throws ArgumentError getnext(parseCron("0 0 30 2 *"), DateTime(2021, 1, 1))
 end
+
+@testset "Step field semantics" begin
+    # steps advance from the range start (standard cron: 10-30/7 means
+    # 10,17,24), not from multiples of the step value
+    @test getnext(parseCron("10-30/7 * * * *"), DateTime(2021, 1, 1, 0, 0, 0)) == DateTime(2021, 1, 1, 0, 10, 0)
+    @test getnext(parseCron("10-30/7 * * * *"), DateTime(2021, 1, 1, 0, 18, 0)) == DateTime(2021, 1, 1, 0, 24, 0)
+    @test getnext(parseCron("10-30/7 * * * *"), DateTime(2021, 1, 1, 0, 25, 0)) == DateTime(2021, 1, 1, 1, 10, 0)
+    # day-of-month wildcards step from 1: */10 means the 1st, 11th, 21st, 31st
+    @test getnext(parseCron("0 0 */10 * *"), DateTime(2021, 1, 2)) == DateTime(2021, 1, 11)
+    # a stepped range that excludes the current value must wrap to the range
+    # start (this used to advance a year per iteration without terminating)
+    @test getnext(parseCron("0 0 1 4-6/2 *"), DateTime(2021, 8, 15)) == DateTime(2022, 4, 1)
+    @test getnext(parseCron("0 0 1 4-6/2 *"), DateTime(2021, 5, 15)) == DateTime(2021, 6, 1)
+    # day-of-week steps count from Sunday (previously a missing method)
+    @test getnext(parseCron("0 0 0 * * */2"), DateTime(2021, 1, 2)) == DateTime(2021, 1, 3)
+    # a zero step would divide by zero at evaluation time
+    @test_throws ArgumentError parseCron("*/0 * * * *")
+    # wildcard steps are unchanged: */15 still means 0,15,30,45
+    @test getnext(parseCron("*/15 * * * *"), DateTime(2021, 1, 1, 0, 12, 0)) == DateTime(2021, 1, 1, 0, 15, 0)
+end
