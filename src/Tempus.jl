@@ -57,6 +57,25 @@ Defines options for job execution behavior.
     max_executions::Union{Int, Nothing} = nothing # max number of _successful_ executions job is allowed to run
     expires_at::Union{DateTime, Nothing} = nothing # expiration time for job
     timezone::Union{Nothing, String} = nothing # IANA timezone, e.g. "America/Denver"
+
+    # validate at construction: a bad option caught here fails the Job/Scheduler
+    # definition, rather than misbehaving inside the scheduler loop later (an
+    # unrecognized overlap_policy would leave ready executions queued forever,
+    # and a bad timezone would throw while computing the next execution)
+    function JobOptions(overlap_policy, retries, retry_delays, retry_check,
+                        max_failed_executions, max_executions, expires_at, timezone)
+        overlap_policy === nothing || overlap_policy in (:skip, :queue, :concurrent) ||
+            throw(ArgumentError("overlap_policy must be :skip, :queue, or :concurrent, got $(repr(overlap_policy))"))
+        retries >= 0 || throw(ArgumentError("retries must be non-negative, got $retries"))
+        max_failed_executions === nothing || max_failed_executions > 0 ||
+            throw(ArgumentError("max_failed_executions must be positive, got $max_failed_executions"))
+        max_executions === nothing || max_executions > 0 ||
+            throw(ArgumentError("max_executions must be positive, got $max_executions"))
+        timezone === nothing || TimeZones.istimezone(timezone) ||
+            throw(ArgumentError("unknown timezone: $(repr(timezone))"))
+        return new(overlap_policy, retries, retry_delays, retry_check,
+                   max_failed_executions, max_executions, expires_at, timezone)
+    end
 end
 
 Base.show(io::IO, opts::JobOptions) = print(io, "Tempus.JobOptions(overlap_policy=$(opts.overlap_policy), retries=$(opts.retries), max_failed_executions=$(opts.max_failed_executions), max_executions=$(opts.max_executions), expires_at=$(opts.expires_at), timezone=$(opts.timezone))")
@@ -485,7 +504,10 @@ mutable struct Scheduler
         expires_at::Union{DateTime, Nothing}=nothing,
         max_concurrent_executions::Int=Threads.nthreads(),
         logging::Bool=true,
-    ) = new(ReentrantLock(), JobExecution[], store, Threads.Event(), Set{JobExecution}(), false, JobOptions(; overlap_policy, retries, retry_delays, retry_check, max_failed_executions, max_executions, expires_at), max_concurrent_executions, logging)
+    ) = begin
+        max_concurrent_executions >= 1 || throw(ArgumentError("max_concurrent_executions must be at least 1, got $max_concurrent_executions"))
+        new(ReentrantLock(), JobExecution[], store, Threads.Event(), Set{JobExecution}(), false, JobOptions(; overlap_policy, retries, retry_delays, retry_check, max_failed_executions, max_executions, expires_at), max_concurrent_executions, logging)
+    end
 end
 
 Scheduler(backend::AbstractStores.AbstractStore; kw...) =
@@ -505,10 +527,11 @@ Starts the scheduler, executing jobs at their scheduled times.
 """
 function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
     scheduler.logging && @info "Starting scheduler and all jobs."
-    reset(scheduler.jobExecutionFinished)
     jobs = getJobs(scheduler.store)
     # generate initial JobExecution list
     @lock scheduler.lock begin
+        scheduler.running && throw(ArgumentError("scheduler is already running; close it before calling run! again"))
+        reset(scheduler.jobExecutionFinished)
         scheduler.running = true
         empty!(scheduler.executingJobExecutions)
         empty!(scheduler.jobExecutions)

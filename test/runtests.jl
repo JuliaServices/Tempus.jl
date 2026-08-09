@@ -841,3 +841,15 @@ end
     @test all(je -> je.job.name != "unsched", scheduler.jobExecutions)
     close(scheduler; timeout=3)
 end
+
+@testset "Options validation" begin
+    @test_throws ArgumentError Tempus.Job(() -> nothing, "v1", "* * * * *"; overlap_policy=:sometimes)
+    @test_throws ArgumentError Tempus.Job(() -> nothing, "v2", "* * * * *"; timezone="America/Nowhere")
+    @test_throws ArgumentError Tempus.Job(() -> nothing, "v3", "* * * * *"; retries=-1)
+    @test_throws ArgumentError Tempus.Job(() -> nothing, "v4", "* * * * *"; max_executions=0)
+    @test_throws ArgumentError Tempus.Scheduler(; max_concurrent_executions=0)
+    scheduler = Tempus.Scheduler(; logging=false)
+    Tempus.run!(scheduler)
+    @test_throws ArgumentError Tempus.run!(scheduler)  # second loop would double-dispatch
+    close(scheduler; timeout=2)
+end
