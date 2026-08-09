@@ -774,3 +774,44 @@ end
     Tempus.runJobs!(Tempus.InMemoryStore(), [slow]; logging=false)
     @test runs[] == 1
 end
+
+@testset "One-shot single pending execution" begin
+    # dispatching a one-shot used to pre-schedule a duplicate immediate
+    # execution (the history check ran before the first attempt recorded),
+    # which double-ran the job under :concurrent overlap
+    runs = Ref(0)
+    job = Tempus.OneShotJob(() -> (sleep(1.2); runs[] += 1), "oneshot_concurrent_once")
+    Tempus.runJobs!(Tempus.InMemoryStore(), [job]; overlap_policy=:concurrent, max_concurrent_executions=4, logging=false)
+    @test runs[] == 1
+
+    # a failing one-shot is still re-attempted (now scheduled at completion
+    # rather than speculatively at dispatch) until max_failed_executions
+    attempts = Ref(0)
+    failing = Tempus.OneShotJob(() -> (attempts[] += 1; error("boom")), "oneshot_reattempt"; retries=0)
+    Tempus.runJobs!(Tempus.InMemoryStore(), [failing]; retries=0, max_failed_executions=2, logging=false)
+    @test attempts[] == 2
+end
+
+@testset "Saturated scheduler queue stays bounded" begin
+    # at the concurrency limit the loop used to schedule \"next\" executions
+    # every pass; for jobs without a cron schedule each got a fresh
+    # millisecond timestamp, defeating dedup and growing the queue unboundedly
+    store = Tempus.InMemoryStore()
+    scheduler = Tempus.Scheduler(store; max_concurrent_executions=1, logging=false)
+    Tempus.run!(scheduler)
+    push!(scheduler, Tempus.Job(() -> sleep(6), "blocker", "* * * * * *"))
+    push!(scheduler, Tempus.Job(() -> nothing, "starved", "* * * * * *"))
+    sleep(5)
+    @test length(scheduler.jobExecutions) <= 4
+    close(scheduler; timeout=2)
+end
+
+@testset "Re-push replaces queued executions" begin
+    scheduler = Tempus.Scheduler(; logging=false)
+    Tempus.run!(scheduler)
+    job = Tempus.Job(() -> nothing, "repush", "0 0 1 1 *")
+    push!(scheduler, job)
+    push!(scheduler, job)
+    @test count(je -> je.job.name == "repush", scheduler.jobExecutions) == 1
+    close(scheduler; timeout=2)
+end

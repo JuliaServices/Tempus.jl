@@ -537,36 +537,39 @@ function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
                     break
                 end
                 # check for jobs that are ready to execute
+                resort = false
                 for (i, je) in enumerate(scheduler.jobExecutions)
                     if je.scheduledStart <= now
                         if isdisabled(je.job)
                             push!(readyToExecute, (i, true, je))
                         elseif length(scheduler.executingJobExecutions) >= scheduler.max_concurrent_executions
-                            # scheduler is already executing at limit, keep execution queued, but check to schedule next execution
-                            next = nextJobExecution(scheduler, je.job)
-                            if next !== nothing && !any(j -> j.job.name == je.job.name && j.scheduledStart == next.scheduledStart, scheduler.jobExecutions)
-                                push!(scheduler.jobExecutions, next)
-                            end
+                            # scheduler is already executing at limit; leave the
+                            # execution queued, it is dispatched (and the job's
+                            # following execution scheduled) once capacity frees up
                         elseif any(j -> j.job.name == je.job.name, scheduler.executingJobExecutions)
-                            if _some(je.job.options.overlap_policy, scheduler.jobOptions.overlap_policy) == :skip
+                            overlap_policy = _some(je.job.options.overlap_policy, scheduler.jobOptions.overlap_policy)
+                            if overlap_policy == :skip
                                 push!(readyToExecute, (i, true, je))
-                            elseif _some(je.job.options.overlap_policy, scheduler.jobOptions.overlap_policy) == :concurrent
+                            elseif overlap_policy == :concurrent
                                 push!(readyToExecute, (i, false, je))
                                 push!(scheduler.executingJobExecutions, je)
                                 je.runConcurrently = true
-                            elseif _some(je.job.options.overlap_policy, scheduler.jobOptions.overlap_policy) == :queue
-                                nexecs = count(j -> j.job.name == je.job.name, scheduler.jobExecutions)
-                                scheduler.logging && @warn "Job $(je.job.name) already executing, keeping scheduled execution queued until current execution finishes. There are $nexecs queued for this job."
-                                next = nextJobExecution(scheduler, je.job)
-                                if next !== nothing && !any(j -> j.job.name == je.job.name && j.scheduledStart == next.scheduledStart, scheduler.jobExecutions)
-                                    push!(scheduler.jobExecutions, next)
+                            elseif overlap_policy == :queue
+                                next = scheduleNextExecution!(scheduler, je.job)
+                                if next !== nothing
+                                    resort = true
+                                    if scheduler.logging
+                                        nexecs = count(j -> j.job.name == je.job.name, scheduler.jobExecutions)
+                                        @warn "Job $(je.job.name) already executing, keeping scheduled execution queued until current execution finishes. There are $nexecs queued for this job."
+                                    end
                                 end
                             end
                         else
                             push!(readyToExecute, (i, false, je))
                             push!(scheduler.executingJobExecutions, je)
                         end
-                    elseif je.scheduledStart > now
+                    else
+                        # scheduler.jobExecutions is sorted by scheduledStart
                         break
                     end
                 end
@@ -576,10 +579,8 @@ function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
                     sort!(readyToExecute, by=x -> x[1], rev=true)
                     for (i, toSkip, je) in readyToExecute
                         deleteat!(scheduler.jobExecutions, i)
-                        next = nextJobExecution(scheduler, je.job)
-                        if next !== nothing && !any(j -> j.job.name == je.job.name && j.scheduledStart == next.scheduledStart, scheduler.jobExecutions)
-                            push!(scheduler.jobExecutions, next)
-                        end
+                        next = scheduleNextExecution!(scheduler, je.job)
+                        resort |= next !== nothing
                         if scheduler.logging
                             if isdisabled(je.job)
                                 if next !== nothing
@@ -602,8 +603,9 @@ function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
                             end
                         end
                     end
-                    sort!(scheduler.jobExecutions, by=je->je.scheduledStart)
                 end
+                # restore scheduledStart order after any scheduling this pass
+                resort && sort!(scheduler.jobExecutions, by=je->je.scheduledStart)
             end
             filter!(x -> !x[2], readyToExecute)
             if !isempty(readyToExecute)
@@ -625,6 +627,36 @@ function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
         end
     end)
     return scheduler
+end
+
+"""
+    scheduleNextExecution!(scheduler::Scheduler, job::Job)
+
+Schedule `job`'s next execution, returning it, or `nothing` when no execution
+was scheduled: the job is done (see [`nextJobExecution`](@ref)), it has been
+removed from the store, an execution at the same time is already queued, or —
+for one-shot jobs, which are rescheduled only when an attempt fails — an
+execution is already queued or running. `scheduler.lock` must be held.
+
+The new execution is appended without re-sorting (so callers iterating
+`scheduler.jobExecutions` or holding indexes into it stay valid); callers must
+restore scheduledStart order before the scheduler loop scans the list again.
+"""
+function scheduleNextExecution!(scheduler::Scheduler, job::Job)
+    # a job removed from the store (e.g. via `purgeJob!`) must not be revived
+    haskey(scheduler.store.jobs, job.name) || return nothing
+    next = nextJobExecution(scheduler, job)
+    next === nothing && return nothing
+    if job.schedule === nothing
+        # one-shot jobs have no future occurrences: an already queued or
+        # currently running execution means this attempt is already covered
+        (any(je -> je.job.name == job.name, scheduler.jobExecutions) ||
+            any(je -> je.job.name == job.name, scheduler.executingJobExecutions)) && return nothing
+    elseif any(je -> je.job.name == job.name && je.scheduledStart == next.scheduledStart, scheduler.jobExecutions)
+        return nothing
+    end
+    push!(scheduler.jobExecutions, next)
+    return next
 end
 
 function executeJob!(scheduler::Scheduler, jobExecution::JobExecution)
@@ -678,13 +710,21 @@ function executeJob!(scheduler::Scheduler, jobExecution::JobExecution)
             scheduler.logging && @error "[$(jobExecution.jobExecutionId)]: Failed to store execution of job $(jobExecution.job.name); its execution history is now incomplete" exception=(e, catch_backtrace())
         end
         # run next execution eligibility checks with the latest execution persisted
-        next = nextJobExecution(scheduler, jobExecution.job)
         @lock scheduler.lock begin
+            delete!(scheduler.executingJobExecutions, jobExecution)
+            if jobExecution.job.schedule === nothing
+                # one-shot jobs schedule a follow-up attempt (nothing when the
+                # execution history now disqualifies the job) only after the
+                # in-flight execution has finished and been recorded
+                next = scheduleNextExecution!(scheduler, jobExecution.job)
+                next === nothing || sort!(scheduler.jobExecutions, by=je->je.scheduledStart)
+            else
+                next = nextJobExecution(scheduler, jobExecution.job)
+            end
             if next === nothing
                 # if the job should not be scheduled again, drop any queued executions for it
                 filter!(je -> je.job.name != jobExecution.job.name, scheduler.jobExecutions)
             end
-            delete!(scheduler.executingJobExecutions, jobExecution)
             !scheduler.running && isempty(scheduler.executingJobExecutions) && notify(scheduler.jobExecutionFinished)
         end
     end)
@@ -732,15 +772,18 @@ Base.wait(scheduler::Scheduler) = wait(scheduler.jobExecutionFinished)
     push!(scheduler::Scheduler, job::Job)
 
 Adds a job to the scheduler and underlying Store, scheduling its next execution based on its cron schedule.
+Pushing a job whose name is already scheduled replaces the stored job and any queued (not yet running) executions.
 """
 function Base.push!(scheduler::Scheduler, job::Job)
     @lock scheduler.lock begin
         addJob!(scheduler.store, job)
-        next = nextJobExecution(scheduler, job)
+        # drop queued executions from a previous version of this job so the
+        # schedule reflects the job as just pushed
+        filter!(je -> je.job.name != job.name, scheduler.jobExecutions)
+        next = scheduleNextExecution!(scheduler, job)
         if next === nothing
             return job
         end
-        push!(scheduler.jobExecutions, next)
         scheduler.logging && @info "[$(next.jobExecutionId)]: Adding job $(job.name) to scheduler and scheduling next execution at $(next.scheduledStart)."
         sort!(scheduler.jobExecutions, by=je->je.scheduledStart)
     end
