@@ -826,3 +826,18 @@ end
     @test history[1].result === nothing  # was left #undef, so show() threw UndefRefError
     @test sprint(show, history[1]) isa String
 end
+
+@testset "unschedule!" begin
+    store = Tempus.InMemoryStore()
+    job = Tempus.Job(() -> nothing, "unsched", "* * * * * *")
+    scheduler = Tempus.Scheduler(store; logging=false)
+    Tempus.run!(scheduler)
+    push!(scheduler, job)
+    sleep(1.5)
+    Tempus.unschedule!(scheduler, job)
+    @test isempty(Tempus.getJobs(store))
+    @test isempty(Tempus.getNMostRecentJobExecutions(store, "unsched", 10))
+    sleep(1.5)  # an in-flight execution finishing must not resurrect the job
+    @test all(je -> je.job.name != "unsched", scheduler.jobExecutions)
+    close(scheduler; timeout=3)
+end

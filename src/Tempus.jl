@@ -792,6 +792,25 @@ function Base.push!(scheduler::Scheduler, job::Job)
 end
 
 """
+    unschedule!(scheduler::Scheduler, job::Union{Job, AbstractString})
+
+Removes a job (by reference or name) from the scheduler and the underlying
+store, canceling any queued executions and deleting the job's execution
+history. An already running execution finishes but is not rescheduled.
+
+See [`disable!`](@ref)/[`disableJob!`](@ref) to keep a job (and its history)
+around while preventing it from running.
+"""
+function unschedule!(scheduler::Scheduler, job::Union{Job, AbstractString})
+    name = job isa Job ? job.name : String(job)
+    @lock scheduler.lock begin
+        filter!(je -> je.job.name != name, scheduler.jobExecutions)
+        purgeJob!(scheduler.store, name)
+    end
+    return
+end
+
+"""
     withscheduler(f, args...; kw...)
 
 Creates a scheduler, runs a function `f` with it, then calls `close`.
