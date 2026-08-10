@@ -749,30 +749,41 @@ function executeJob!(scheduler::Scheduler, jobExecution::JobExecution)
             jobExecution.finish = Dates.now(UTC)
             scheduler.logging && @info "[$(jobExecution.jobExecutionId)]: Job $(jobExecution.job.name) execution finished at $(jobExecution.finish)"
         end
-        # store the job execution; a persisting store serializes the execution,
-        # including whatever the job returned or threw, so a value it cannot
-        # encode must not take the scheduler's bookkeeping down with it
-        try
-            storeJobExecution!(scheduler.store, jobExecution)
-        catch e
-            scheduler.logging && @error "[$(jobExecution.jobExecutionId)]: Failed to store execution of job $(jobExecution.job.name); its execution history is now incomplete" exception=(e, catch_backtrace())
-        end
-        # run next execution eligibility checks with the latest execution persisted
+        # Serialize completion bookkeeping with push!/unschedule!. Otherwise a
+        # finishing execution can recreate history after unschedule! purges it,
+        # or apply its old options to a same-name replacement.
         @lock scheduler.lock begin
             delete!(scheduler.executingJobExecutions, jobExecution)
             try
-                if jobExecution.job.schedule === nothing
-                    # one-shot jobs schedule a follow-up attempt (nothing when
-                    # the execution history now disqualifies the job) only after
-                    # the in-flight execution has finished and been recorded
-                    next = scheduleNextExecution!(scheduler, jobExecution.job)
-                    next === nothing || sort!(scheduler.jobExecutions, by=je->je.scheduledStart)
-                else
-                    next = nextJobExecution(scheduler, jobExecution.job)
-                end
-                if next === nothing
-                    # if the job should not be scheduled again, drop any queued executions for it
+                current_job = get(scheduler.store.jobs, jobExecution.job.name, nothing)
+                if current_job === nothing
+                    # The job was removed while this execution was running. Do
+                    # not recreate its history or leave stale queued executions.
                     filter!(je -> je.job.name != jobExecution.job.name, scheduler.jobExecutions)
+                else
+                    # A persisting store serializes the execution, including
+                    # whatever the job returned or threw. An unencodable value
+                    # must not take the scheduler's bookkeeping down with it.
+                    try
+                        storeJobExecution!(scheduler.store, jobExecution)
+                    catch e
+                        scheduler.logging && @error "[$(jobExecution.jobExecutionId)]: Failed to store execution of job $(jobExecution.job.name); its execution history is now incomplete" exception=(e, catch_backtrace())
+                    end
+
+                    if current_job.schedule === nothing
+                        # One-shot jobs schedule a follow-up attempt (nothing
+                        # when history disqualifies the current stored job) only
+                        # after the in-flight execution has finished.
+                        next = scheduleNextExecution!(scheduler, current_job)
+                        next === nothing || sort!(scheduler.jobExecutions, by=je->je.scheduledStart)
+                    else
+                        next = nextJobExecution(scheduler, current_job)
+                    end
+                    if next === nothing
+                        # If the current job should not be scheduled again, drop
+                        # any queued executions for its name.
+                        filter!(je -> je.job.name != current_job.name, scheduler.jobExecutions)
+                    end
                 end
             catch e
                 # a store error here must not skip the notify below (that would

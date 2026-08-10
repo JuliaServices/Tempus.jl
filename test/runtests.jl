@@ -825,6 +825,35 @@ end
     push!(scheduler, job)
     @test count(je -> je.job.name == "repush", scheduler.jobExecutions) == 1
     close(scheduler; timeout=2)
+
+    # A finishing execution from the old definition must use the current stored
+    # job's options. The old max_executions=1 used to disable this replacement.
+    started = Channel{Nothing}(1)
+    release = Channel{Nothing}(1)
+    new_ran = Channel{Nothing}(1)
+    store = Tempus.InMemoryStore()
+    scheduler = Tempus.Scheduler(store; logging=false)
+    old_job = Tempus.Job(
+        () -> (put!(started, nothing); take!(release); nothing),
+        "running_replacement",
+        "* * * * * *";
+        max_executions=1,
+    )
+    new_job = Tempus.Job(
+        () -> put!(new_ran, nothing),
+        "running_replacement",
+        "* * * * * *",
+    )
+    Tempus.run!(scheduler)
+    push!(scheduler, old_job)
+    take!(started)
+    push!(scheduler, new_job)
+    put!(release, nothing)
+    @test Base.timedwait(() -> isready(new_ran), 5) == :ok
+    take!(new_ran)
+    stored = only(filter(job -> job.name == new_job.name, Tempus.getJobs(store)))
+    @test !Tempus.isdisabled(stored)
+    close(scheduler; timeout=2)
 end
 
 @testset "Failed execution is showable" begin
@@ -840,16 +869,36 @@ end
 
 @testset "unschedule!" begin
     store = Tempus.InMemoryStore()
-    job = Tempus.Job(() -> nothing, "unsched", "* * * * * *")
     scheduler = Tempus.Scheduler(store; logging=false)
     Tempus.run!(scheduler)
+
+    # A queued execution is cancelled with its stored job and history.
+    job = Tempus.Job(() -> nothing, "unsched", "0 0 1 1 *")
     push!(scheduler, job)
-    sleep(1.5)
     Tempus.unschedule!(scheduler, job)
     @test isempty(Tempus.getJobs(store))
     @test isempty(Tempus.getNMostRecentJobExecutions(store, "unsched", 10))
-    sleep(1.5)  # an in-flight execution finishing must not resurrect the job
     @test all(je -> je.job.name != "unsched", scheduler.jobExecutions)
+
+    # Completion must be serialized with unschedule!. It used to store history
+    # after the purge and silently recreate the execution-history key.
+    started = Channel{Nothing}(1)
+    release = Channel{Nothing}(1)
+    running = Tempus.OneShotJob(
+        () -> (put!(started, nothing); take!(release); nothing),
+        "unsched_running",
+    )
+    push!(scheduler, running)
+    take!(started)
+    Tempus.unschedule!(scheduler, running)
+    put!(release, nothing)
+    @test Base.timedwait(
+        () -> (@lock scheduler.lock isempty(scheduler.executingJobExecutions)),
+        5,
+    ) == :ok
+    @test isempty(Tempus.getJobs(store))
+    @test isempty(Tempus.getNMostRecentJobExecutions(store, "unsched_running", 10))
+    @test all(je -> je.job.name != "unsched_running", scheduler.jobExecutions)
     close(scheduler; timeout=3)
 end
 
