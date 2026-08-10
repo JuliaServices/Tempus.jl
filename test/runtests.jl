@@ -650,6 +650,11 @@ end
     one_shot = Tempus.OneShotJob(() -> nothing, "oneshot"; retries=3)
     @test one_shot.options.max_executions == 1
     @test one_shot.options.retries == 3
+    @test Tempus.OneShotJob(
+        () -> nothing,
+        "oneshot_override";
+        max_executions=nothing,
+    ).options.max_executions == 1
 end
 
 @testset "Timezone-aware getnext" begin
