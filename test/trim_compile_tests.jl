@@ -5,7 +5,6 @@ const _TRIM_PRE_RELEASE = !isempty(VERSION.prerelease)
 const _TRIM_SETUP_TIMEOUT_S = Sys.iswindows() ? 600.0 : 180.0
 const _TRIM_COMPILE_TIMEOUT_S = Sys.iswindows() ? 600.0 : 300.0
 const _TRIM_EXECUTABLE_TIMEOUT_S = Sys.iswindows() ? 120.0 : 30.0
-const _TRIM_USE_BUNDLE = Sys.iswindows()
 const _JULIAC_ENTRYPOINT_EXPR =
     "using JuliaC; if isdefined(JuliaC, :main); JuliaC.main(ARGS); else JuliaC._main_cli(ARGS); end"
 
@@ -91,12 +90,7 @@ function _run_trim_case(project_path::String)
     julia = joinpath(Sys.BINDIR, Base.julia_exename())
     mktempdir() do directory
         output_name = Sys.iswindows() ? "tempus_trim.exe" : "tempus_trim"
-        bundle = _TRIM_USE_BUNDLE ? joinpath(directory, "bundle") : nothing
-        command = if bundle === nothing
-            _clean_cmd(`$julia --startup-file=no --history-file=no --project=$project_path -e $(_JULIAC_ENTRYPOINT_EXPR) -- --output-exe $output_name --project=$project_path --experimental --trim=safe $script_path`)
-        else
-            _clean_cmd(`$julia --startup-file=no --history-file=no --project=$project_path -e $(_JULIAC_ENTRYPOINT_EXPR) -- --output-exe $output_name --bundle $bundle --project=$project_path --experimental --trim=safe $script_path`)
-        end
+        command = _clean_cmd(`$julia --startup-file=no --history-file=no --project=$project_path -e $(_JULIAC_ENTRYPOINT_EXPR) -- --output-exe $output_name --project=$project_path --experimental --trim=safe $script_path`)
         cd(directory) do
             exit_code, output, timed_out = _run_command_with_timeout(
                 command;
@@ -112,8 +106,7 @@ function _run_trim_case(project_path::String)
             @test warnings == 0
             @test exit_code == 0
 
-            executable = bundle === nothing ? joinpath(directory, output_name) :
-                         joinpath(bundle, "bin", output_name)
+            executable = joinpath(directory, output_name)
             @test isfile(executable)
             exit_code == 0 && isfile(executable) || return nothing
             run_exit, run_output, run_timed_out = _run_command_with_timeout(
@@ -135,6 +128,12 @@ end
         @test true
     elseif Sys.WORD_SIZE != 64
         println("[trim] skip non-64-bit Julia")
+        @test true
+    elseif Sys.iswindows()
+        println(
+            "[trim] skip Windows: Base.Artifacts override discovery used by " *
+            "TimeZones is not trim-safe on stock Julia",
+        )
         @test true
     elseif !_TRIM_SUPPORTED
         println("[trim] skip Julia < 1.12")
