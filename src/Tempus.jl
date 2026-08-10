@@ -4,7 +4,7 @@ Tempus provides a cron-style job scheduling framework for Julia, inspired by Qua
 ## Features:
 - Define jobs with cron-like scheduling expressions
 - Supports job execution policies (overlap handling, retries, and failure strategies)
-- Multiple job stores and JobStore interface (in-memory, file-based persistence)
+- Pluggable persistent state via AbstractStores.jl backends (memory, file, SQL, Redis)
 - Concurrency-aware execution with configurable retry logic
 - Supports disabling, enabling, and unscheduling jobs dynamically
 - Thread-safe scheduling with a background execution loop
@@ -182,8 +182,14 @@ nextJobExecution(scheduler, job::Job) =
         logging=scheduler.logging
     )
 
-# for a given `job`` persisted in `store`, check status of job and return the next DateTime when it should be executed
-# `nothing` is returned if the job shouldn't be scheduled again
+"""
+    nextJobExecution(store::Store, job::Job) -> Union{JobExecution, Nothing}
+
+For a `job` persisted in `store`, check the job's status and execution history
+and return a `JobExecution` for the next time it should run, or `nothing` if
+the job shouldn't be scheduled again. As a side effect, jobs that have expired
+or reached their execution caps are disabled in the store.
+"""
 function nextJobExecution(store::Store, job::Job, max_failed_executions=job.options.max_failed_executions, max_executions=job.options.max_executions, expires_at=job.options.expires_at; logging::Bool=true)
     # if job is already disabled, return nothing
     isdisabled(job) && return nothing
@@ -521,9 +527,13 @@ function Base.show(io::IO, scheduler::Scheduler)
 end
 
 """
-    run!(scheduler::Scheduler)
+    run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
 
-Starts the scheduler, executing jobs at their scheduled times.
+Starts the scheduler, executing jobs at their scheduled times. The dispatch
+loop runs on a background task; `run!` returns the scheduler immediately.
+With `close_when_no_jobs=true`, the loop shuts down on its own once no
+executions are queued or running (see [`runJobs!`](@ref)). Throws if the
+scheduler is already running.
 """
 function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
     scheduler.logging && @info "Starting scheduler and all jobs."
@@ -765,10 +775,10 @@ function executeJob!(scheduler::Scheduler, jobExecution::JobExecution)
 end
 
 """
-    close(scheduler::Scheduler)
+    close(scheduler::Scheduler; timeout::Real=5)
 
-Closes the scheduler, stopping job execution; waits for any currently executing jobs to finish.
-Will wait `timeout` seconds (5 by default) for any currently executing jobs to finish before returning.
+Closes the scheduler, stopping job execution; waits up to `timeout` seconds
+(5 by default) for any currently executing jobs to finish before returning.
 """
 function Base.close(scheduler::Scheduler; timeout::Real=5)
     scheduler.logging && @info "Closing scheduler and waiting $(timeout)s for job executions to stop."
