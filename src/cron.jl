@@ -278,7 +278,12 @@ function getnext(cron::Cron, from::DateTime=Dates.now(UTC))
     limit = from + MAX_LOOKAHEAD
     next = trunc(from, Second) + Second(1)
     while true
-        next > limit && throw(ArgumentError("cron expression $cron does not fire within $MAX_LOOKAHEAD of $from"))
+        # Keep this diagnostic literal. Formatting a DateTime here pulls the
+        # dynamic Dates display path into every compiled getnext call, even
+        # when the search limit is not reached.
+        next > limit && throw(ArgumentError(
+            "cron expression does not fire within the 10-year search horizon",
+        ))
         # check month
         curMonth = Month(next)
         if !allowed(curMonth, cron.month)
