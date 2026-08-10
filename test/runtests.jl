@@ -2,9 +2,28 @@ using Test, AbstractStores, Dates, JSON, SQLite, Tempus
 
 import Tempus: parseCronField, parseCron, getnext
 
+# Event-driven test plumbing — no sleep-based synchronization: job actions
+# signal Channels and tests block on those signals, with a generous bound so a
+# regression fails the test instead of hanging CI.
+const EVENT_TIMEOUT = 30.0
+
+function take_within!(ch::Channel, timeout::Real=EVENT_TIMEOUT)
+    timedwait(() -> isready(ch), timeout; pollint=0.001) === :ok ||
+        error("timed out after $(timeout)s waiting for a test signal")
+    return take!(ch)
+end
+
+waitfor(pred, timeout::Real=EVENT_TIMEOUT) = timedwait(pred, timeout; pollint=0.001) === :ok
+
+drain!(ch::Channel) = (while isready(ch); take!(ch); end; ch)
+
 # A named function remains resolvable when a persistent store is reopened.
-_filestore_test_action() = (global executed; push!(executed, Dates.now(UTC)))
+const FS_RAN = Channel{Nothing}(1000)
+_filestore_test_action() = put!(FS_RAN, nothing)
 _sqlite_test_action() = nothing
+
+struct FailingHistoryStore <: AbstractStores.AbstractStore{Vector{Tempus.JobExecution}} end
+Base.get(::FailingHistoryStore, ::AbstractString, default) = error("history unavailable")
 
 @testset "parseCronField Tests" begin
     # Wildcard: should parse "*" into a Wildcard type.
@@ -269,168 +288,145 @@ end
 end
 
 # -- Higher-Level Tests for Scheduler --
-# we make this a global variable so we can access it in the test cases
-# even when a job gets serialized/deserialized for a file store
-executed = DateTime[]
 
 @testset "Scheduler Scheduling and Execution" begin
-    # We'll create a simple job that records its execution time.
+    # a job on an every-second schedule runs, and keeps being rescheduled
+    ran = Channel{Nothing}(100)
     test_job = Tempus.Job("testjob", "* * * * * *") do
-        global executed
-        push!(executed, Dates.now(UTC))
+        put!(ran, nothing)
     end
     withscheduler() do sch
-        # Schedule the test job.
         push!(sch, test_job)
-        # Job should run every second, so we wait for a few seconds and check if it ran.
-        sleep(2)  # wait for the job to run multiple times
+        take_within!(ran)
+        take_within!(ran)
     end
-    @test length(executed) > 0
-    # disabled job doesn't run
-    empty!(executed)
+    # disabled job doesn't run: an enabled sentinel on the same schedule ticks
+    # twice, so the disabled job had (at least) the same dispatch opportunities
+    drain!(ran)
+    ticks = Channel{Nothing}(100)
     Tempus.disable!(test_job)
     withscheduler() do sch
         push!(sch, test_job)
-        sleep(2)  # wait for the job to run multiple times if it was enabled
+        push!(sch, Tempus.Job(() -> put!(ticks, nothing), "ticker", "* * * * * *"))
+        take_within!(ticks)
+        take_within!(ticks)
+        @test !isready(ran)
     end
-    @test length(executed) == 0
     # re-enable
-    empty!(executed)
+    drain!(ran)
     Tempus.enable!(test_job)
     withscheduler() do sch
         push!(sch, test_job)
-        sleep(2)  # wait for the job to run multiple times
+        take_within!(ran)
     end
-    @test length(executed) > 0
-    # overlap policy
-    # skip
-    # job that takes 2 seconds to run, but runs every second
-    sleep_job = Tempus.Job("sleepjob", "* * * * * *") do
-        sleep(2)
-        push!(executed, Dates.now(UTC))
+
+    # overlap policies: a job that blocks until released, so the test controls
+    # exactly when an execution is "still running"
+    started = Channel{Nothing}(100)
+    release = Channel{Nothing}(100)
+    blocked_job = Tempus.Job("blockedjob", "* * * * * *") do
+        put!(started, nothing)
+        take!(release)
     end
-    empty!(executed)
-    withscheduler(; overlap_policy=:skip) do sch
-        push!(sch, sleep_job)
-        sleep(2.5)  # wait for the job to run once
+    # :skip — while one execution runs, ready executions are dropped; the
+    # sentinel ticking twice proves the loop had dispatch passes in that window
+    withscheduler(; overlap_policy=:skip, max_concurrent_executions=4) do sch
+        push!(sch, blocked_job)
+        push!(sch, Tempus.Job(() -> put!(ticks, nothing), "skip_ticker", "* * * * * *"))
+        take_within!(started)
+        drain!(ticks)
+        take_within!(ticks)
+        take_within!(ticks)
+        @test !isready(started)
+        # pre-load releases so this and any subsequent execution finish quickly
+        foreach(_ -> put!(release, nothing), 1:10)
     end
-    @test length(executed) == 1
-    # concurrent
-    empty!(executed)
+    # :concurrent — a second execution starts while the first is still blocked;
+    # the second `started` signal with zero releases granted is the proof
+    drain!(started); drain!(release)
     withscheduler(; overlap_policy=:concurrent, max_concurrent_executions=2) do sch
-        push!(sch, sleep_job)
-        sleep(2.5)  # wait for the job to run once
+        push!(sch, blocked_job)
+        take_within!(started)
+        take_within!(started)
+        foreach(_ -> put!(release, nothing), 1:10)
     end
-    @test length(executed) == 2
-    # queue
-    empty!(executed)
-    withscheduler(; overlap_policy=:queue) do sch
-        push!(sch, sleep_job)
-        sleep(3.5)  # wait for the job to start executing twice sequentially
+    # :queue — the next execution waits until the current one finishes, then runs
+    drain!(started); drain!(release)
+    withscheduler(; overlap_policy=:queue, max_concurrent_executions=4) do sch
+        push!(sch, blocked_job)
+        push!(sch, Tempus.Job(() -> put!(ticks, nothing), "queue_ticker", "* * * * * *"))
+        take_within!(started)
+        drain!(ticks)
+        take_within!(ticks)
+        take_within!(ticks)
+        @test !isready(started)          # queued, not started, while running
+        put!(release, nothing)           # finish the first execution
+        take_within!(started)            # the queued execution now runs
+        foreach(_ -> put!(release, nothing), 1:10)
     end
-    @test length(executed) == 2
-    # retry settings
-    # retry n times
+
+    # retries: attempts happen within one execution until success
+    attempts = Channel{Int}(100)
+    nattempts = Ref(0)
     fail_job = Tempus.Job("failjob", "* * * * * *") do
-        println("length(executed): ", length(executed))
-        if length(executed) < 2
-            push!(executed, Dates.now(UTC))
-            error("Job failed")
-        end
+        nattempts[] += 1
+        put!(attempts, nattempts[])
+        nattempts[] <= 2 && error("Job failed")
+        nothing
     end
-    empty!(executed)
     withscheduler(; retries=2) do sch
         push!(sch, fail_job)
-        sleep(3)  # wait for the job to run multiple times
+        @test take_within!(attempts) == 1   # fails
+        @test take_within!(attempts) == 2   # first retry fails
+        @test take_within!(attempts) == 3   # second retry succeeds
     end
-    @test length(executed) == 2
-    # retry check
+    # retry_check controls whether a retry happens at all
     toggle = Ref{Bool}(true)
+    check_decisions = Channel{Bool}(100)
     retry_check = (s, e) -> begin
-        if toggle[] 
-            println("Retry triggered")
-            toggle[] = false
-            return true
-        else
-            println("Retry not triggered")
-            return false
-        end
+        decision = toggle[]
+        toggle[] = false
+        put!(check_decisions, decision)
+        return decision
     end
-    empty!(executed)
-    withscheduler(; retries=2, retry_check=retry_check) do sch
-        push!(sch, fail_job)
-        sleep(3)  # wait for the job to run multiple times
+    check_attempts = Channel{Nothing}(100)
+    check_job = Tempus.Job("checkjob", "* * * * * *") do
+        put!(check_attempts, nothing)
+        error("always fails")
     end
-    @test length(executed) == 2
+    withscheduler(; retries=2, retry_check=retry_check, max_failed_executions=1) do sch
+        push!(sch, check_job)
+        take_within!(check_attempts)         # first try fails
+        @test take_within!(check_decisions)  # check allows one retry
+        take_within!(check_attempts)         # the retry fails too
+        @test !take_within!(check_decisions) # and the next retry is denied
+    end
     @test toggle[] == false
-    # # on_fail_policy
-    # # ignore
-    # always_fail_job = Tempus.Job("failjob", "* * * * * *") do
-    #     push!(executed, Dates.now(UTC))
-    #     error("always fail job")
-    # end
-    # empty!(executed)
-    # withscheduler(; on_fail_policy=(:ignore, 0)) do sch
-    #     push!(sch, always_fail_job)
-    #     sleep(4)  # wait for the job to run multiple times
-    # end
-    # @test length(executed) > 4 # job should run every second + retries, but never get disabled
-    # # on_fail_policy disable job after 1 failure
-    # empty!(executed)
-    # Tempus.enable!(always_fail_job)
-    # withscheduler(; retries=0, on_fail_policy=(:disable, 1)) do sch
-    #     push!(sch, always_fail_job)
-    #     sleep(4)  # wait to verify job does not run
-    # end
-    # @test length(executed) == 1 # job ran once, failed, and was disabled
-    # @test Tempus.isdisabled(always_fail_job)
-    # # on_fail_policy unschedule the job after 1 failure
-    # empty!(executed)
-    # Tempus.enable!(always_fail_job)
-    # withscheduler(; retries=0, on_fail_policy=(:unschedule, 1)) do sch
-    #     push!(sch, always_fail_job)
-    #     sleep(3)  # wait job to run, fail, and be unscheduled and ensure it isn't run again
-    #     @test all(je -> je.job.name != always_fail_job.name, sch.jobExecutions)
-    # end
-    # @test length(executed) == 1 # job ran once, failed, and was unscheduled
-
-    # if execution is being retried n times and job gets disabled/unscheduled, retries are stopped
-
-    # dyanmically schedule and unschedule multiple jobs
-
-    # test job stores
-    # InMemoryStore
-
-    # test the job is dynamically added to store
-
-    # job is automatically started when persisted in store
-
-    # if job is disabled, it persists through scheduler restart
 
     # FileStore uses a directory and persists both jobs and execution history.
-    empty!(executed)
     mktempdir() do path
+        drain!(FS_RAN)
         fs_job = Tempus.Job(_filestore_test_action, "testjob_fs", "* * * * * *")
         fs = Tempus.FileStore(path)
         withscheduler(fs) do sch
             push!(sch, fs_job)
-            sleep(3)
+            take_within!(FS_RAN)
         end
-        @test length(executed) > 0
+        # close waited for the execution, whose history write happens before
+        # its completion becomes observable
         @test !isempty(
             Tempus.getNMostRecentJobExecutions(fs, "testjob_fs", 10),
         )
 
         # Reopen the same backend and verify both forms of state survived.
-        empty!(executed)
+        drain!(FS_RAN)
         fs = Tempus.FileStore(path)
         @test !isempty(
             Tempus.getNMostRecentJobExecutions(fs, "testjob_fs", 10),
         )
         withscheduler(fs) do sch
-            sleep(3)
+            take_within!(FS_RAN)
         end
-        @test length(executed) > 0
     end
 end
 
@@ -526,25 +522,29 @@ end
 
 @testset "Unstorable execution does not wedge the scheduler" begin
     mktempdir() do dir
-        runs = Ref(0)
+        ran = Channel{Nothing}(100)
+        task_release = Channel{Nothing}(100)
         job = Tempus.Job("unstorable_result", "* * * * * *") do
-            runs[] += 1
+            put!(ran, nothing)
             # a *running* Task cannot be serialized, so persisting this
             # execution throws inside the execution task
-            return Threads.@spawn (sleep(30); nothing)
+            return Threads.@spawn (take!(task_release); nothing)
         end
         scheduler = Tempus.Scheduler(Tempus.FileStore(dir); logging=false)
         try
             Tempus.run!(scheduler)
             push!(scheduler, job)
-            sleep(3.5)
-            @test runs[] > 1                                    # still scheduling
-            @test isempty(scheduler.executingJobExecutions)     # bookkeeping intact
+            take_within!(ran)
+            take_within!(ran)   # still scheduling after the storage failure
+            # bookkeeping intact: the failed store must not strand the execution
+            @test waitfor(() -> (@lock scheduler.lock isempty(scheduler.executingJobExecutions)))
         finally
             # stop the loop without waiting: if this regression ever comes back,
             # `close` blocks on executions that never finished bookkeeping, and a
             # hung test is worse than a failed one
             @lock scheduler.lock (scheduler.running = false)
+            # let the unstorable tasks the executions returned finish
+            foreach(_ -> put!(task_release, nothing), 1:10)
         end
     end
 end
@@ -565,13 +565,19 @@ end
 end
 
 @testset "OneShot max_executions regression" begin
-    runs = Ref(0)
-    job = Tempus.OneShotJob(() -> (runs[] += 1), "oneshot_once")
+    ran = Channel{Nothing}(10)
+    job = Tempus.OneShotJob(() -> put!(ran, nothing), "oneshot_once")
     withscheduler(; logging=false) do scheduler
         push!(scheduler, job)
-        sleep(2)
+        take_within!(ran)
+        # success disables the stored job; once that lands, no further
+        # execution can be scheduled — and none may have run in the meantime
+        @test waitfor(() -> begin
+            stored = get(scheduler.store.jobs, "oneshot_once", nothing)
+            stored !== nothing && Tempus.isdisabled(stored)
+        end)
+        @test !isready(ran)
     end
-    @test runs[] == 1
 end
 
 @testset "nextJobExecution bounds regression" begin
@@ -584,14 +590,26 @@ end
 end
 
 @testset "Queue scheduling dedupe regression" begin
+    started = Channel{Nothing}(10)
+    release = Channel{Nothing}(10)
     job = Tempus.Job("queue_dedupe_regression", "* * * * * *") do
-        sleep(2)
+        put!(started, nothing)
+        take!(release)
     end
-    withscheduler(; overlap_policy=:queue, logging=false) do scheduler
+    # max_concurrent_executions must exceed 1 (the CI default when
+    # single-threaded): a blocked job at the concurrency limit parks in the
+    # at-limit branch and the :queue scheduling under test never runs
+    withscheduler(; overlap_policy=:queue, max_concurrent_executions=4, logging=false) do scheduler
         push!(scheduler, job)
-        sleep(3.5)
-        scheduled = [je.scheduledStart for je in scheduler.jobExecutions if je.job.name == "queue_dedupe_regression"]
-        @test length(scheduled) == length(unique(scheduled))
+        take_within!(started)
+        # while the job runs, :queue keeps scheduling its future occurrences;
+        # wait for two to accumulate, which must have distinct scheduled times
+        @test waitfor(() -> @lock scheduler.lock count(je -> je.job.name == "queue_dedupe_regression", scheduler.jobExecutions) >= 2)
+        @lock scheduler.lock begin
+            scheduled = [je.scheduledStart for je in scheduler.jobExecutions if je.job.name == "queue_dedupe_regression"]
+            @test length(scheduled) == length(unique(scheduled))
+        end
+        foreach(_ -> put!(release, nothing), 1:10)
     end
 end
 
@@ -607,9 +625,10 @@ end
     withscheduler(; logging=true) do scheduler
         push!(scheduler, job)
         Tempus.disable!(job)
-        sleep(1.5)
+        # the disabled execution is dispatched down the skip path — exercising
+        # the "no next execution scheduled" logging branch — and dropped
+        @test waitfor(() -> @lock scheduler.lock all(je -> je.job.name != "logging_none_next", scheduler.jobExecutions))
     end
-    @test true
 end
 
 @testset "SQLite load mapping regression" begin
@@ -647,6 +666,11 @@ end
     one_shot = Tempus.OneShotJob(() -> nothing, "oneshot"; retries=3)
     @test one_shot.options.max_executions == 1
     @test one_shot.options.retries == 3
+    @test Tempus.OneShotJob(
+        () -> nothing,
+        "oneshot_override";
+        max_executions=nothing,
+    ).options.max_executions == 1
 end
 
 @testset "Timezone-aware getnext" begin
@@ -661,6 +685,23 @@ end
     # Fall back: 1:30 AM ambiguous Nov 3, 2024 → first occurrence (MDT, UTC-6)
     cron = parseCron("0 30 1 * * *")
     @test getnext(cron, "America/Denver", DateTime(2024,11,3)) == DateTime(2024,11,3,7,30,0)
+
+    # Forward offset changes are not always one hour. Lord Howe advances by 30
+    # minutes, so an every-second schedule resumes at 2:30 AM local.
+    cron = parseCron("* * * * * *")
+    @test getnext(cron, "Australia/Lord_Howe", DateTime(2024,10,5,15,29,59)) ==
+        DateTime(2024,10,5,15,30,0)
+
+    # Apia skipped all of December 30, 2011. The old one-hour assumption retried
+    # inside the same gap and threw another NonExistentTimeError.
+    @test getnext(cron, "Pacific/Apia", DateTime(2011,12,30,9,59,59)) ==
+        DateTime(2011,12,30,10,0,0)
+
+    # During the second occurrence of a fall-back interval, all ambiguous local
+    # times have already had their selected (first) occurrence. Skip to 2 AM
+    # local instead of returning another first-occurrence time in the past.
+    @test getnext(cron, "America/New_York", DateTime(2024,11,3,6,30,0)) ==
+        DateTime(2024,11,3,7,0,0)
 
     # No timezone = existing UTC behavior
     cron = parseCron("0 0 12 * * *")
@@ -688,4 +729,287 @@ end
     parsed = JSON.parse(job.action_data)
     @test parsed["msg"] == "hello"
     @test job.action(; parsed...) == "hello"
+end
+
+@testset "getnext rollover regressions" begin
+    # every one of these threw an out-of-range ArgumentError, hit an
+    # UndefVarError, or looped forever before the rollover rewrite
+    @test getnext(parseCron("* * * * 0"), DateTime(2021, 1, 2)) == DateTime(2021, 1, 3)  # Sunday never matched dayofweek() == 7
+    @test getnext(parseCron("0 * * * * 0"), DateTime(2021, 1, 3, 10, 30, 0)) == DateTime(2021, 1, 3, 10, 31, 0)
+    @test getnext(parseCron("* * * * 2"), DateTime(2021, 1, 4)) == DateTime(2021, 1, 5)  # UndefVarError branch (advancing to a later weekday)
+    @test getnext(parseCron("0 0 30 * *"), DateTime(2021, 2, 5)) == DateTime(2021, 3, 30)  # "Day: 30 out of range" for February
+    @test getnext(parseCron("0 0 15 * *"), DateTime(2021, 12, 20)) == DateTime(2022, 1, 15)  # "Month: 13 out of range"
+    @test getnext(parseCron("* * * * 2"), DateTime(2021, 1, 30)) == DateTime(2021, 2, 2)  # invalid date via the day-of-week path
+    @test getnext(parseCron("0 0 12 * * *"), DateTime(2021, 1, 31, 13, 0, 0)) == DateTime(2021, 2, 1, 12, 0, 0)  # "Day: 32 out of range"
+    @test getnext(parseCron("30 * * * *"), DateTime(2021, 1, 15, 23, 45, 0)) == DateTime(2021, 1, 16, 0, 30, 0)  # "Hour: 24 out of range"
+    @test getnext(parseCron("30 * * * * *"), DateTime(2021, 1, 15, 23, 59, 45)) == DateTime(2021, 1, 16, 0, 0, 30)  # "Minute: 60 out of range"
+    @test getnext(parseCron("0 0 29 2 *"), DateTime(2021, 3, 1)) == DateTime(2024, 2, 29)  # multi-year day search
+    # an expression that can never fire is a bounded error, not an infinite loop
+    @test_throws ArgumentError getnext(parseCron("0 0 30 2 *"), DateTime(2021, 1, 1))
+end
+
+@testset "Step field semantics" begin
+    # steps advance from the range start (standard cron: 10-30/7 means
+    # 10,17,24), not from multiples of the step value
+    @test getnext(parseCron("10-30/7 * * * *"), DateTime(2021, 1, 1, 0, 0, 0)) == DateTime(2021, 1, 1, 0, 10, 0)
+    @test getnext(parseCron("10-30/7 * * * *"), DateTime(2021, 1, 1, 0, 18, 0)) == DateTime(2021, 1, 1, 0, 24, 0)
+    @test getnext(parseCron("10-30/7 * * * *"), DateTime(2021, 1, 1, 0, 25, 0)) == DateTime(2021, 1, 1, 1, 10, 0)
+    # day-of-month wildcards step from 1: */10 means the 1st, 11th, 21st, 31st
+    @test getnext(parseCron("0 0 */10 * *"), DateTime(2021, 1, 2)) == DateTime(2021, 1, 11)
+    # a stepped range that excludes the current value must wrap to the range
+    # start (this used to advance a year per iteration without terminating)
+    @test getnext(parseCron("0 0 1 4-6/2 *"), DateTime(2021, 8, 15)) == DateTime(2022, 4, 1)
+    @test getnext(parseCron("0 0 1 4-6/2 *"), DateTime(2021, 5, 15)) == DateTime(2021, 6, 1)
+    # day-of-week steps count from Sunday (previously a missing method)
+    @test getnext(parseCron("0 0 0 * * */2"), DateTime(2021, 1, 2)) == DateTime(2021, 1, 3)
+    # a zero step would divide by zero at evaluation time
+    @test_throws ArgumentError parseCron("*/0 * * * *")
+    # wildcard steps are unchanged: */15 still means 0,15,30,45
+    @test getnext(parseCron("*/15 * * * *"), DateTime(2021, 1, 1, 0, 12, 0)) == DateTime(2021, 1, 1, 0, 15, 0)
+end
+
+@testset "Cron parsing extensions" begin
+    # 7 is Sunday, same as 0 (standard cron accepts both)
+    @test getnext(parseCron("* * * * 7"), DateTime(2021, 1, 2)) == DateTime(2021, 1, 3)
+    @test getnext(parseCron("0 0 0 * * 5-7"), DateTime(2021, 1, 9)) == DateTime(2021, 1, 10)   # Sat -> Sun via a range through 7
+    @test getnext(parseCron("0 0 0 * * 5-7"), DateTime(2021, 1, 4)) == DateTime(2021, 1, 8)    # Mon -> Fri
+    # month and day-of-week names, case-insensitive
+    @test getnext(parseCron("0 0 * * MON-FRI"), DateTime(2021, 1, 2)) == DateTime(2021, 1, 4)
+    @test getnext(parseCron("0 0 1 JAN *"), DateTime(2021, 3, 1)) == DateTime(2022, 1, 1)
+    @test getnext(parseCron("0 0 * * sun"), DateTime(2021, 1, 4)) == DateTime(2021, 1, 10)
+    # @-aliases
+    @test getnext(parseCron("@daily"), DateTime(2021, 1, 1, 5, 0, 0)) == DateTime(2021, 1, 2)
+    @test getnext(parseCron("@hourly"), DateTime(2021, 1, 1, 5, 30, 0)) == DateTime(2021, 1, 1, 6, 0, 0)
+    @test getnext(parseCron("@weekly"), DateTime(2021, 1, 4)) == DateTime(2021, 1, 10)
+    @test getnext(parseCron("@monthly"), DateTime(2021, 1, 4)) == DateTime(2021, 2, 1)
+    @test getnext(parseCron("@yearly"), DateTime(2021, 1, 4)) == DateTime(2022, 1, 1)
+    # whitespace runs and surrounding whitespace are tolerated
+    @test getnext(parseCron("  0  0 * * *\t"), DateTime(2021, 1, 1, 5, 0, 0)) == DateTime(2021, 1, 2)
+    @test_throws ArgumentError parseCron("@reboot")
+    @test_throws ArgumentError parseCron("0 0 * * MONDAY-FRI")
+    @test_throws ArgumentError parseCron("0 0 * * FRI-MON")
+    @test_throws ArgumentError parseCron("* * * * 8")
+end
+
+@testset "close timeout failsafe" begin
+    # Closing a scheduler that never started is already complete.
+    fresh = Tempus.Scheduler(; logging=false)
+    elapsed = @elapsed close(fresh; timeout=2)
+    @test elapsed < 1
+    fresh_wait = @async wait(fresh)
+    @test Base.timedwait(() -> istaskdone(fresh_wait), 1) == :ok
+
+    # A job that outlives the close timeout must not block close. A timeout must
+    # also not signal actual completion or permit a restart that forgets the
+    # still-running execution.
+    started = Channel{Nothing}(1)
+    release = Channel{Nothing}(1)
+    hung = Tempus.OneShotJob(
+        () -> (put!(started, nothing); take!(release); nothing),
+        "hung_close_job",
+    )
+    scheduler = Tempus.Scheduler(; logging=false)
+    Tempus.run!(scheduler)
+    push!(scheduler, hung)
+    take_within!(started)
+    t0 = time()
+    close(scheduler; timeout=0.2)
+    @test time() - t0 < 2
+    @test_throws ArgumentError Tempus.run!(scheduler)
+
+    completion_wait = @async wait(scheduler)
+    yield()
+    @test !istaskdone(completion_wait)
+    put!(release, nothing)
+    @test waitfor(() -> istaskdone(completion_wait), 5)
+
+    # Once the prior loop and execution are truly done, this scheduler is safe
+    # to reuse. The successful one-shot is disabled from its stored history.
+    Tempus.run!(scheduler; close_when_no_jobs=true)
+    wait(scheduler)
+    close(scheduler; timeout=1)
+end
+
+@testset "run! initialization failure leaves scheduler stopped" begin
+    jobs = MemoryStore{Tempus.Job}()
+    store = Tempus.Store(jobs, FailingHistoryStore())
+    Tempus.addJob!(store, Tempus.OneShotJob(() -> nothing, "init_failure"))
+    scheduler = Tempus.Scheduler(store; logging=false)
+
+    @test_throws ErrorException Tempus.run!(scheduler)
+    @test !scheduler.running
+    @test !scheduler.loopActive
+    @test isempty(scheduler.jobExecutions)
+    @test isempty(scheduler.executingJobExecutions)
+    @test (@elapsed close(scheduler; timeout=1)) < 1
+end
+
+@testset "runJobs! waits for in-flight executions" begin
+    # with close_when_no_jobs, the scheduler loop used to break as soon as the
+    # queue was empty even though an execution was still running — and since
+    # only close() cleared scheduler.running, the finishing execution never
+    # notified jobExecutionFinished and wait(scheduler) hung forever
+    started = Channel{Nothing}(1)
+    release = Channel{Nothing}(1)
+    runs = Ref(0)
+    slow = Tempus.OneShotJob("slow_oneshot_wait") do
+        put!(started, nothing)
+        take!(release)
+        runs[] += 1
+    end
+    t = @async Tempus.runJobs!(Tempus.InMemoryStore(), [slow]; logging=false)
+    take_within!(started)      # execution in flight; the queue is now empty
+    @test !istaskdone(t)       # runJobs! must still be waiting on it
+    put!(release, nothing)
+    @test waitfor(() -> istaskdone(t))
+    fetch(t)                   # propagate any runJobs! error
+    @test runs[] == 1
+end
+
+@testset "One-shot single pending execution" begin
+    # dispatching a one-shot used to pre-schedule a duplicate immediate
+    # execution (the history check ran before the first attempt recorded),
+    # which double-ran the job under :concurrent overlap
+    started = Channel{Nothing}(10)
+    release = Channel{Nothing}(10)
+    ticks = Channel{Nothing}(100)
+    store = Tempus.InMemoryStore()
+    scheduler = Tempus.Scheduler(store; overlap_policy=:concurrent, max_concurrent_executions=4, logging=false)
+    Tempus.run!(scheduler)
+    push!(scheduler, Tempus.OneShotJob(() -> (put!(started, nothing); take!(release)), "oneshot_concurrent_once"))
+    push!(scheduler, Tempus.Job(() -> put!(ticks, nothing), "oneshot_ticker", "* * * * * *"))
+    take_within!(started)
+    # two sentinel ticks = at least two dispatch passes with the one-shot
+    # still running; a duplicate execution would have started by now
+    take_within!(ticks)
+    take_within!(ticks)
+    @test !isready(started)
+    foreach(_ -> put!(release, nothing), 1:5)
+    @test waitfor(() -> begin
+        stored = get(store.jobs, "oneshot_concurrent_once", nothing)
+        stored !== nothing && Tempus.isdisabled(stored)
+    end)
+    close(scheduler; timeout=5)
+
+    # a failing one-shot is still re-attempted (now scheduled at completion
+    # rather than speculatively at dispatch) until max_failed_executions
+    attempts = Ref(0)
+    failing = Tempus.OneShotJob(() -> (attempts[] += 1; error("boom")), "oneshot_reattempt"; retries=0)
+    Tempus.runJobs!(Tempus.InMemoryStore(), [failing]; retries=0, max_failed_executions=2, logging=false)
+    @test attempts[] == 2
+end
+
+@testset "Saturated scheduler queue stays bounded" begin
+    # at the concurrency limit the loop used to schedule "next" executions
+    # every pass; for jobs without a cron schedule each got a fresh
+    # millisecond timestamp, defeating dedup and growing the queue unboundedly
+    started = Channel{Nothing}(10)
+    release = Channel{Nothing}(10)
+    store = Tempus.InMemoryStore()
+    scheduler = Tempus.Scheduler(store; max_concurrent_executions=1, logging=false)
+    Tempus.run!(scheduler)
+    push!(scheduler, Tempus.Job(() -> (put!(started, nothing); take!(release)), "blocker", "* * * * * *"))
+    push!(scheduler, Tempus.Job(() -> nothing, "starved", "* * * * * *"))
+    take_within!(started)
+    # a bounded window in which runaway growth would show: the old bug added
+    # ~2 queued executions per second, so exceeding 4 entries fails fast here
+    # while healthy code just rides out the window
+    @test !waitfor(() -> @lock(scheduler.lock, length(scheduler.jobExecutions) > 4), 3.0)
+    foreach(_ -> put!(release, nothing), 1:10)
+    close(scheduler; timeout=5)
+end
+
+@testset "Re-push replaces queued executions" begin
+    scheduler = Tempus.Scheduler(; logging=false)
+    Tempus.run!(scheduler)
+    job = Tempus.Job(() -> nothing, "repush", "0 0 1 1 *")
+    push!(scheduler, job)
+    push!(scheduler, job)
+    @test count(je -> je.job.name == "repush", scheduler.jobExecutions) == 1
+    close(scheduler; timeout=2)
+
+    # A finishing execution from the old definition must use the current stored
+    # job's options. The old max_executions=1 used to disable this replacement.
+    started = Channel{Nothing}(1)
+    release = Channel{Nothing}(1)
+    new_ran = Channel{Nothing}(1)
+    store = Tempus.InMemoryStore()
+    scheduler = Tempus.Scheduler(store; logging=false)
+    old_job = Tempus.Job(
+        () -> (put!(started, nothing); take!(release); nothing),
+        "running_replacement",
+        "* * * * * *";
+        max_executions=1,
+    )
+    new_job = Tempus.Job(
+        () -> put!(new_ran, nothing),
+        "running_replacement",
+        "* * * * * *",
+    )
+    Tempus.run!(scheduler)
+    push!(scheduler, old_job)
+    take_within!(started)
+    push!(scheduler, new_job)
+    put!(release, nothing)
+    take_within!(new_ran)
+    stored = only(filter(job -> job.name == new_job.name, Tempus.getJobs(store)))
+    @test !Tempus.isdisabled(stored)
+    close(scheduler; timeout=2)
+end
+
+@testset "Failed execution is showable" begin
+    store = Tempus.InMemoryStore()
+    job = Tempus.OneShotJob(() -> error("x"), "showable_failure"; retries=0)
+    Tempus.runJobs!(store, [job]; retries=0, max_failed_executions=1, logging=false)
+    history = Tempus.getNMostRecentJobExecutions(store, "showable_failure", 5)
+    @test !isempty(history)
+    @test history[1].status == :failed
+    @test history[1].result === nothing  # was left #undef, so show() threw UndefRefError
+    @test sprint(show, history[1]) isa String
+end
+
+@testset "unschedule!" begin
+    store = Tempus.InMemoryStore()
+    scheduler = Tempus.Scheduler(store; logging=false)
+    Tempus.run!(scheduler)
+
+    # A queued execution is cancelled with its stored job and history.
+    job = Tempus.Job(() -> nothing, "unsched", "0 0 1 1 *")
+    push!(scheduler, job)
+    Tempus.unschedule!(scheduler, job)
+    @test isempty(Tempus.getJobs(store))
+    @test isempty(Tempus.getNMostRecentJobExecutions(store, "unsched", 10))
+    @test all(je -> je.job.name != "unsched", scheduler.jobExecutions)
+
+    # Completion must be serialized with unschedule!. It used to store history
+    # after the purge and silently recreate the execution-history key.
+    started = Channel{Nothing}(1)
+    release = Channel{Nothing}(1)
+    running = Tempus.OneShotJob(
+        () -> (put!(started, nothing); take!(release); nothing),
+        "unsched_running",
+    )
+    push!(scheduler, running)
+    take_within!(started)
+    Tempus.unschedule!(scheduler, running)
+    put!(release, nothing)
+    @test waitfor(() -> @lock scheduler.lock isempty(scheduler.executingJobExecutions))
+    @test isempty(Tempus.getJobs(store))
+    @test isempty(Tempus.getNMostRecentJobExecutions(store, "unsched_running", 10))
+    @test all(je -> je.job.name != "unsched_running", scheduler.jobExecutions)
+    close(scheduler; timeout=3)
+end
+
+@testset "Options validation" begin
+    @test_throws ArgumentError Tempus.Job(() -> nothing, "v1", "* * * * *"; overlap_policy=:sometimes)
+    @test_throws ArgumentError Tempus.Job(() -> nothing, "v2", "* * * * *"; timezone="America/Nowhere")
+    @test_throws ArgumentError Tempus.Job(() -> nothing, "v3", "* * * * *"; retries=-1)
+    @test_throws ArgumentError Tempus.Job(() -> nothing, "v4", "* * * * *"; max_executions=0)
+    @test_throws ArgumentError Tempus.Scheduler(; max_concurrent_executions=0)
+    @test_throws ArgumentError close(Tempus.Scheduler(; logging=false); timeout=-1)
+    @test_throws ArgumentError close(Tempus.Scheduler(; logging=false); timeout=Inf)
+    scheduler = Tempus.Scheduler(; logging=false)
+    Tempus.run!(scheduler)
+    @test_throws ArgumentError Tempus.run!(scheduler)  # second loop would double-dispatch
+    close(scheduler; timeout=2)
 end

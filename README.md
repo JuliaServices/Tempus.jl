@@ -17,7 +17,7 @@
 - Supports retry policies with exponential backoff
 
 ## Installation
-Tempus.jl is registered in the Julia General registry. You can install it directly from GitHub:
+Tempus.jl is registered in the Julia General registry:
 
 ```julia
 using Pkg
@@ -45,6 +45,14 @@ push!(scheduler, job)
 
 # Start the scheduler (runs in a background thread)
 Tempus.run!(scheduler)
+```
+
+### One-Shot Jobs
+```julia
+# runs once, as soon as the scheduler picks it up, then is disabled;
+# failed attempts are re-run until success or max_failed_executions
+job = Tempus.OneShotJob(send_report, "send_report_now")
+push!(scheduler, job)
 ```
 
 ### Disabling and Enabling Jobs
@@ -110,15 +118,39 @@ cannot resolve fails the whole load. Anonymous functions and Julia's native
 serialized representation are not stable across Julia sessions or Julia
 versions.
 
+Treat a persistent store's contents as trusted input: the default backends use
+Julia's `Serialization`, and deserializing attacker-controlled data can execute
+arbitrary code — whoever can write to the store's directory, database, or Redis
+keyspace can run code in any process that reopens it. Protect the backing
+storage with filesystem or database permissions accordingly.
+
 ## Cron Syntax
-Tempus.jl uses a familiar cron syntax for scheduling:
+Tempus.jl uses standard cron syntax, with an optional leading seconds field:
 ```
-* * * * *  → Every minute
-0 12 * * * → Every day at noon
-*/5 * * * * → Every 5 minutes
-# also supports second-level precision
-* * * * * * → Every second
+* * * * *      → Every minute
+0 12 * * *     → Every day at noon
+*/5 * * * *    → Every 5 minutes
+30 4 1,15 * *  → 4:30 AM on the 1st and 15th
+0 22 * * 1-5   → 10 PM on weekdays
+# a 6th trailing field is never needed; a leading seconds field is optional
+* * * * * *    → Every second
 ```
+
+Fields are `minute hour day-of-month month day-of-week` (or with seconds
+first when six fields are given). Supported field forms: `*`, single values,
+ranges (`1-5`), lists (`1,3,5`), and steps (`*/15`, `10-30/7` — steps count
+from the range start, so `10-30/7` fires at 10, 17, and 24). Day-of-week runs
+Sunday to Saturday as 0–6, with 7 also accepted for Sunday. Three-letter,
+case-insensitive names work for months and weekdays (`0 0 1 JAN *`,
+`0 0 * * MON-FRI`), and when both day-of-month and day-of-week are
+restricted, a day matching either fires (standard cron behavior). The common
+aliases `@yearly`/`@annually`, `@monthly`, `@weekly`, `@daily`/`@midnight`,
+and `@hourly` are also accepted.
+
+All schedules are evaluated in UTC unless the job is given a `timezone`
+option (an IANA name like `"America/Denver"`), in which case the schedule is
+interpreted in that timezone: spring-forward gaps are skipped and fall-back
+ambiguities use the first occurrence.
 
 ## Contributing
 Contributions are welcome! To contribute:
