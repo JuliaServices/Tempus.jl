@@ -6,6 +6,9 @@ import Tempus: parseCronField, parseCron, getnext
 _filestore_test_action() = (global executed; push!(executed, Dates.now(UTC)))
 _sqlite_test_action() = nothing
 
+struct FailingHistoryStore <: AbstractStores.AbstractStore{Vector{Tempus.JobExecution}} end
+Base.get(::FailingHistoryStore, ::AbstractString, default) = error("history unavailable")
+
 @testset "parseCronField Tests" begin
     # Wildcard: should parse "*" into a Wildcard type.
     @testset "Wildcard" begin
@@ -762,17 +765,56 @@ end
 end
 
 @testset "close timeout failsafe" begin
-    # a job that outlives the close timeout must not block close forever: the
-    # old timer callback was guarded by isopen(t), which is already false
-    # inside an expired one-shot Timer's callback, so the failsafe never fired
-    hung = Tempus.OneShotJob(() -> sleep(60), "hung_close_job")
+    # Closing a scheduler that never started is already complete.
+    fresh = Tempus.Scheduler(; logging=false)
+    elapsed = @elapsed close(fresh; timeout=2)
+    @test elapsed < 1
+    fresh_wait = @async wait(fresh)
+    @test Base.timedwait(() -> istaskdone(fresh_wait), 1) == :ok
+
+    # A job that outlives the close timeout must not block close. A timeout must
+    # also not signal actual completion or permit a restart that forgets the
+    # still-running execution.
+    started = Channel{Nothing}(1)
+    release = Channel{Nothing}(1)
+    hung = Tempus.OneShotJob(
+        () -> (put!(started, nothing); take!(release); nothing),
+        "hung_close_job",
+    )
     scheduler = Tempus.Scheduler(; logging=false)
     Tempus.run!(scheduler)
     push!(scheduler, hung)
-    sleep(1.5)  # let the execution start
+    take!(started)
     t0 = time()
-    close(scheduler; timeout=2)
-    @test time() - t0 < 30
+    close(scheduler; timeout=0.2)
+    @test time() - t0 < 2
+    @test_throws ArgumentError Tempus.run!(scheduler)
+
+    completion_wait = @async wait(scheduler)
+    yield()
+    @test !istaskdone(completion_wait)
+    put!(release, nothing)
+    @test Base.timedwait(() -> istaskdone(completion_wait), 5) == :ok
+
+    # Once the prior loop and execution are truly done, this scheduler is safe
+    # to reuse. The successful one-shot is disabled from its stored history.
+    Tempus.run!(scheduler; close_when_no_jobs=true)
+    wait(scheduler)
+    close(scheduler; timeout=1)
+end
+
+@testset "run! initialization failure leaves scheduler stopped" begin
+    jobs = MemoryStore{Tempus.Job}()
+    store = Tempus.Store(jobs, FailingHistoryStore())
+    Tempus.addJob!(store, Tempus.OneShotJob(() -> nothing, "init_failure"))
+    scheduler = Tempus.Scheduler(store; logging=false)
+
+    @test_throws ErrorException Tempus.run!(scheduler)
+    @test !scheduler.running
+    @test !scheduler.loopActive
+    @test isempty(scheduler.jobExecutions)
+    @test isempty(scheduler.executingJobExecutions)
+    @test (@elapsed close(scheduler; timeout=1)) < 1
 end
 
 @testset "runJobs! waits for in-flight executions" begin
@@ -908,6 +950,8 @@ end
     @test_throws ArgumentError Tempus.Job(() -> nothing, "v3", "* * * * *"; retries=-1)
     @test_throws ArgumentError Tempus.Job(() -> nothing, "v4", "* * * * *"; max_executions=0)
     @test_throws ArgumentError Tempus.Scheduler(; max_concurrent_executions=0)
+    @test_throws ArgumentError close(Tempus.Scheduler(; logging=false); timeout=-1)
+    @test_throws ArgumentError close(Tempus.Scheduler(; logging=false); timeout=Inf)
     scheduler = Tempus.Scheduler(; logging=false)
     Tempus.run!(scheduler)
     @test_throws ArgumentError Tempus.run!(scheduler)  # second loop would double-dispatch

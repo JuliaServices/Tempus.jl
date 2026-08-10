@@ -497,6 +497,7 @@ The main scheduling engine that executes jobs according to their schedules.
 - `jobExecutionFinished::Threads.Event`: Signals all job executions have finished when shutting down.
 - `executingJobExecutions::Set{JobExecution}`: Tracks currently executing jobs.
 - `running::Bool`: Scheduler state (running/stopped).
+- `loopActive::Bool`: Whether the dispatch-loop task has finished stopping.
 - `jobOptions::JobOptions`: Default job execution options.
 - `max_concurrent_executions::Int`: Limit on how many total executions can be running concurrently for this scheduler, defaults to `Threads.nthreads()`
 - `logging::Bool`: Whether to emit log messages during scheduler operations, defaults to `true`.
@@ -508,6 +509,7 @@ mutable struct Scheduler
     const jobExecutionFinished::Threads.Event
     const executingJobExecutions::Set{JobExecution}
     running::Bool
+    loopActive::Bool
     const jobOptions::JobOptions
     const max_concurrent_executions::Int
     const logging::Bool
@@ -524,7 +526,7 @@ mutable struct Scheduler
         logging::Bool=true,
     ) = begin
         max_concurrent_executions >= 1 || throw(ArgumentError("max_concurrent_executions must be at least 1, got $max_concurrent_executions"))
-        new(ReentrantLock(), JobExecution[], store, Threads.Event(), Set{JobExecution}(), false, JobOptions(; overlap_policy, retries, retry_delays, retry_check, max_failed_executions, max_executions, expires_at), max_concurrent_executions, logging)
+        new(ReentrantLock(), JobExecution[], store, Threads.Event(), Set{JobExecution}(), false, false, JobOptions(; overlap_policy, retries, retry_delays, retry_check, max_failed_executions, max_executions, expires_at), max_concurrent_executions, logging)
     end
 end
 
@@ -545,26 +547,32 @@ Starts the scheduler, executing jobs at their scheduled times. The dispatch
 loop runs on a background task; `run!` returns the scheduler immediately.
 With `close_when_no_jobs=true`, the loop shuts down on its own once no
 executions are queued or running (see [`runJobs!`](@ref)). Throws if the
-scheduler is already running.
+scheduler is already running or a previous timed-out close still has loop or
+job tasks in flight.
 """
 function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
     scheduler.logging && @info "Starting scheduler and all jobs."
-    jobs = getJobs(scheduler.store)
-    # generate initial JobExecution list
     @lock scheduler.lock begin
         scheduler.running && throw(ArgumentError("scheduler is already running; close it before calling run! again"))
-        reset(scheduler.jobExecutionFinished)
-        scheduler.running = true
-        empty!(scheduler.executingJobExecutions)
-        empty!(scheduler.jobExecutions)
-        for job in jobs
-            # get next job execution for each job
+        scheduler.loopActive &&
+            throw(ArgumentError("the previous scheduler loop is still stopping"))
+        isempty(scheduler.executingJobExecutions) ||
+            throw(ArgumentError("the scheduler still has in-flight job executions"))
+
+        # Build the initial queue before changing lifecycle state. A store error
+        # here must leave the scheduler stopped and safe to retry.
+        initial_executions = JobExecution[]
+        for job in getJobs(scheduler.store)
             je = nextJobExecution(scheduler, job)
-            if je !== nothing
-                push!(scheduler.jobExecutions, je)
-            end
+            je === nothing || push!(initial_executions, je)
         end
-        sort!(scheduler.jobExecutions, by=je->je.scheduledStart)
+        sort!(initial_executions, by=je->je.scheduledStart)
+
+        reset(scheduler.jobExecutionFinished)
+        empty!(scheduler.jobExecutions)
+        append!(scheduler.jobExecutions, initial_executions)
+        scheduler.running = true
+        scheduler.loopActive = true
     end
     # start scheduler job execution task
     errormonitor(Threads.@spawn :interactive try
@@ -670,6 +678,7 @@ function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
         # `wait(scheduler)` never returns)
         @lock scheduler.lock begin
             scheduler.running = false
+            scheduler.loopActive = false
             isempty(scheduler.executingJobExecutions) && notify(scheduler.jobExecutionFinished)
         end
     end)
@@ -791,7 +800,8 @@ function executeJob!(scheduler::Scheduler, jobExecution::JobExecution)
                 # eligibility is re-checked at every dispatch anyway
                 scheduler.logging && @error "[$(jobExecution.jobExecutionId)]: Failed to determine job $(jobExecution.job.name)'s next execution" exception=(e, catch_backtrace())
             end
-            !scheduler.running && isempty(scheduler.executingJobExecutions) && notify(scheduler.jobExecutionFinished)
+            !scheduler.running && !scheduler.loopActive &&
+                isempty(scheduler.executingJobExecutions) && notify(scheduler.jobExecutionFinished)
         end
     end)
     return
@@ -804,24 +814,30 @@ Closes the scheduler, stopping job execution; waits up to `timeout` seconds
 (5 by default) for any currently executing jobs to finish before returning.
 """
 function Base.close(scheduler::Scheduler; timeout::Real=5)
+    isfinite(timeout) && timeout >= 0 ||
+        throw(ArgumentError("timeout must be a finite non-negative number, got $timeout"))
     scheduler.logging && @info "Closing scheduler and waiting $(timeout)s for job executions to stop."
     @lock scheduler.lock begin
         scheduler.running = false
+        if !scheduler.loopActive && isempty(scheduler.executingJobExecutions)
+            notify(scheduler.jobExecutionFinished)
+        end
     end
-    # we use a Timer here to notify jobExecutionFinished ourself if the scheduler
-    # or last executing job doesn't do it themselves in time (note a one-shot
-    # Timer is already closed inside its own callback, so the callback must not
-    # be guarded by isopen; cancellation is handled by close(timer) below)
-    timer = Timer(timeout) do t
+
+    # Do not notify jobExecutionFinished on timeout. That event means the loop
+    # and every execution are actually finished; using it as a timeout signal
+    # makes wait(scheduler) lie and permits an unsafe restart of active work.
+    status = Base.timedwait(
+        () -> (@lock scheduler.lock begin
+            !scheduler.loopActive && isempty(scheduler.executingJobExecutions)
+        end),
+        timeout,
+    )
+    if status == :timed_out
         scheduler.logging && @warn "Scheduler closing timeout reached, returning without waiting for job executions to finish."
-        notify(scheduler.jobExecutionFinished)
+    else
+        scheduler.logging && @info "Scheduler closed and job execution stopped."
     end
-    try
-        wait(scheduler.jobExecutionFinished)
-    finally
-        close(timer)
-    end
-    scheduler.logging && @info "Scheduler closed and job execution stopped."
     return
 end
 
