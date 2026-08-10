@@ -47,6 +47,14 @@ push!(scheduler, job)
 Tempus.run!(scheduler)
 ```
 
+### One-Shot Jobs
+```julia
+# runs once, as soon as the scheduler picks it up, then is disabled;
+# failed attempts are re-run until success or max_failed_executions
+job = Tempus.OneShotJob(send_report, "send_report_now")
+push!(scheduler, job)
+```
+
 ### Disabling and Enabling Jobs
 ```julia
 Tempus.disable!(job)  # Prevents the job from running

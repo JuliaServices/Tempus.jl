@@ -114,6 +114,18 @@ function Job(action::Function, name, schedule;
     Job(ReentrantLock(), action, ref, data, string(name), schedule_parsed, JobOptions(; kw...), nothing)
 end
 
+"""
+    OneShotJob(action, name; kw...)
+
+A [`Job`](@ref) with no cron schedule that runs once, as soon as the scheduler
+picks it up, and is then disabled. A failed attempt is re-run (with the job's
+retry options applied within each attempt) until it succeeds or reaches
+`max_failed_executions`. Accepts the same keyword options as `Job`.
+
+Note the run-once bookkeeping is based on the job's stored execution history,
+so re-adding a one-shot job whose name has already succeeded will not run it
+again; use a fresh name (or [`purgeJob!`](@ref)) to re-run one.
+"""
 function OneShotJob(action::Function, name;
         job_params=nothing, action_ref::Union{Nothing,String}=nothing, kw...)
     ref = action_ref !== nothing ? action_ref : _function_ref(action)
