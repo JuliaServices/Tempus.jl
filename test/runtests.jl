@@ -1013,3 +1013,5 @@ end
     @test_throws ArgumentError Tempus.run!(scheduler)  # second loop would double-dispatch
     close(scheduler; timeout=2)
 end
+
+include("trim_compile_tests.jl")
