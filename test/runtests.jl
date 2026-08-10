@@ -681,6 +681,12 @@ end
     @test getnext(cron, "Pacific/Apia", DateTime(2011,12,30,9,59,59)) ==
         DateTime(2011,12,30,10,0,0)
 
+    # During the second occurrence of a fall-back interval, all ambiguous local
+    # times have already had their selected (first) occurrence. Skip to 2 AM
+    # local instead of returning another first-occurrence time in the past.
+    @test getnext(cron, "America/New_York", DateTime(2024,11,3,6,30,0)) ==
+        DateTime(2024,11,3,7,0,0)
+
     # No timezone = existing UTC behavior
     cron = parseCron("0 0 12 * * *")
     @test getnext(cron, DateTime(2024,1,15)) == DateTime(2024,1,15,12,0,0)

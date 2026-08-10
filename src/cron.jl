@@ -354,9 +354,13 @@ function getnext(cron::Cron, timezone::String, from::DateTime=Dates.now(UTC))
     next_local = getnext(cron, from_local)
     # Convert back to UTC, handling DST transitions
     next_utc = _local_to_utc(next_local, tz, cron)
-    # Safety: if result <= from (possible around fall-back), advance and retry
+    # If `from` is in the second occurrence of a fall-back interval, choosing
+    # the first occurrence of an ambiguous match puts it in the past. Skip the
+    # rest of the repeated local interval; every ambiguous time in it has
+    # already had its selected (first) occurrence.
     if next_utc <= from
-        next_local2 = getnext(cron, next_local + Second(1))
+        repeated_end = firstunambiguouslocal(next_local, tz)
+        next_local2 = getnext(cron, repeated_end - Second(1))
         next_utc = _local_to_utc(next_local2, tz, cron)
     end
     return next_utc
@@ -413,6 +417,41 @@ function validlocal(local_dt::DateTime, tz::TimeZone)
         return true
     catch e
         e isa TimeZones.AmbiguousTimeError && return true
+        e isa TimeZones.NonExistentTimeError && return false
+        rethrow()
+    end
+end
+
+# Find the end of a repeated local-time interval. The caller has already
+# selected the first occurrence, so later matches inside the same ambiguous
+# interval must not be returned as future times during the second occurrence.
+function firstunambiguouslocal(local_dt::DateTime, tz::TimeZone)
+    step = Millisecond(1)
+    upper = local_dt + step
+    while !unambiguouslocal(upper, tz)
+        step *= 2
+        upper = local_dt + step
+    end
+
+    lower = local_dt
+    while upper - lower > Millisecond(1)
+        distance = Dates.value(upper - lower)
+        middle = lower + Millisecond(distance ÷ 2)
+        if unambiguouslocal(middle, tz)
+            upper = middle
+        else
+            lower = middle
+        end
+    end
+    return upper
+end
+
+function unambiguouslocal(local_dt::DateTime, tz::TimeZone)
+    try
+        ZonedDateTime(local_dt, tz)
+        return true
+    catch e
+        e isa TimeZones.AmbiguousTimeError && return false
         e isa TimeZones.NonExistentTimeError && return false
         rethrow()
     end
