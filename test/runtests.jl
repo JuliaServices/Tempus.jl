@@ -662,6 +662,17 @@ end
     cron = parseCron("0 30 1 * * *")
     @test getnext(cron, "America/Denver", DateTime(2024,11,3)) == DateTime(2024,11,3,7,30,0)
 
+    # Forward offset changes are not always one hour. Lord Howe advances by 30
+    # minutes, so an every-second schedule resumes at 2:30 AM local.
+    cron = parseCron("* * * * * *")
+    @test getnext(cron, "Australia/Lord_Howe", DateTime(2024,10,5,15,29,59)) ==
+        DateTime(2024,10,5,15,30,0)
+
+    # Apia skipped all of December 30, 2011. The old one-hour assumption retried
+    # inside the same gap and threw another NonExistentTimeError.
+    @test getnext(cron, "Pacific/Apia", DateTime(2011,12,30,9,59,59)) ==
+        DateTime(2011,12,30,10,0,0)
+
     # No timezone = existing UTC behavior
     cron = parseCron("0 0 12 * * *")
     @test getnext(cron, DateTime(2024,1,15)) == DateTime(2024,1,15,12,0,0)

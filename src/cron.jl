@@ -368,12 +368,12 @@ function _local_to_utc(local_dt::DateTime, tz::TimeZone, cron::Cron)
         return DateTime(zdt, UTC)
     catch e
         if e isa TimeZones.NonExistentTimeError
-            # Spring forward: this local time doesn't exist (e.g. 2:30 AM during spring-forward).
-            # Skip to end of gap and find the next valid cron match.
-            advanced = trunc(local_dt + Hour(1), Hour)
-            next_local = getnext(cron, advanced - Second(1))
-            zdt = ZonedDateTime(next_local, tz)
-            return DateTime(zdt, UTC)
+            # Offset changes are not always one hour: Lord Howe advances by 30
+            # minutes, and Apia skipped a whole day in 2011. Find the actual end
+            # of this gap, then resume cron matching there.
+            gap_end = firstvalidlocal(local_dt, tz)
+            next_local = getnext(cron, gap_end - Second(1))
+            return _local_to_utc(next_local, tz, cron)
         elseif e isa TimeZones.AmbiguousTimeError
             # Fall back: this local time occurs twice. Use first occurrence (before clocks change).
             zdt = ZonedDateTime(local_dt, tz, 1)
@@ -381,5 +381,39 @@ function _local_to_utc(local_dt::DateTime, tz::TimeZone, cron::Cron)
         else
             rethrow()
         end
+    end
+end
+
+# Find the first valid local millisecond after a non-existent local time. This
+# uses only the public ZonedDateTime constructor rather than TimeZones internals.
+function firstvalidlocal(local_dt::DateTime, tz::TimeZone)
+    step = Millisecond(1)
+    upper = local_dt + step
+    while !validlocal(upper, tz)
+        step *= 2
+        upper = local_dt + step
+    end
+
+    lower = local_dt
+    while upper - lower > Millisecond(1)
+        distance = Dates.value(upper - lower)
+        middle = lower + Millisecond(distance ÷ 2)
+        if validlocal(middle, tz)
+            upper = middle
+        else
+            lower = middle
+        end
+    end
+    return upper
+end
+
+function validlocal(local_dt::DateTime, tz::TimeZone)
+    try
+        ZonedDateTime(local_dt, tz)
+        return true
+    catch e
+        e isa TimeZones.AmbiguousTimeError && return true
+        e isa TimeZones.NonExistentTimeError && return false
+        rethrow()
     end
 end
