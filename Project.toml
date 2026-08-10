@@ -1,6 +1,6 @@
 name = "Tempus"
 uuid = "e6262be2-5787-4bdc-bc3f-4b5a3442fa30"
-version = "3.1.0"
+version = "3.1.1"
 
 [deps]
 AbstractStores = "b8592f88-5fd7-4e10-8c52-04e8e19aea3c"
