@@ -596,7 +596,10 @@ end
         put!(started, nothing)
         take!(release)
     end
-    withscheduler(; overlap_policy=:queue, logging=false) do scheduler
+    # max_concurrent_executions must exceed 1 (the CI default when
+    # single-threaded): a blocked job at the concurrency limit parks in the
+    # at-limit branch and the :queue scheduling under test never runs
+    withscheduler(; overlap_policy=:queue, max_concurrent_executions=4, logging=false) do scheduler
         push!(scheduler, job)
         take_within!(started)
         # while the job runs, :queue keeps scheduling its future occurrences;
