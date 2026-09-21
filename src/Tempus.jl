@@ -43,8 +43,8 @@ Defines options for job execution behavior.
 - `retries::Int`: Number of retries allowed on failure.
 - `retry_delays::Union{Base.ExponentialBackOff, Nothing}`: Delay strategy for retries (defaults to exponential backoff if `retries > 0`).
 - `retry_check`: Custom function to determine retry behavior (`check` argument from `Base.retry`).
-- `max_failed_executions::Union{Int, Nothing}`: Maximum number of failed executions allowed for a job before it will be disabled.
-- `max_executions::Union{Int, Nothing}`: Maximum number of executions allowed for a job.
+- `max_failed_executions::Union{Int, Nothing}`: Number of consecutive failed executions that disables a job.
+- `max_executions::Union{Int, Nothing}`: Maximum number of successful executions in the retained history.
 - `expires_at::Union{DateTime, Nothing}`: Expiration time for a job.
 - `timezone::Union{Nothing, String}`: IANA timezone name (e.g. `"America/Denver"`). When set, the job's cron schedule is interpreted in this timezone. `nothing` means UTC.
 """
@@ -213,7 +213,7 @@ function nextJobExecution(store::Store, job::Job, max_failed_executions=job.opti
         return nothing
     end
     # pull job execution history for other checks
-    nexecs = max(0, something(max_failed_executions, 0), something(max_executions, 0))
+    nexecs = max_executions === nothing ? something(max_failed_executions, 0) : store.history_limit
     execs = getNMostRecentJobExecutions(store, job.name, nexecs)
     # check if max number of executions has been reached
     if max_executions !== nothing && count(e -> e.status == :succeeded, execs) >= max_executions
@@ -222,7 +222,7 @@ function nextJobExecution(store::Store, job::Job, max_failed_executions=job.opti
         return nothing
     end
     # check if max number of failed executions has been reached
-    if max_failed_executions !== nothing && max_executions !== nothing && max_failed_executions < max_executions
+    if max_failed_executions !== nothing
         execs = @view execs[1:min(max_failed_executions, length(execs))]
     end
     if max_failed_executions !== nothing && count(e -> e.status == :failed, execs) >= max_failed_executions
