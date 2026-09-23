@@ -631,9 +631,15 @@ function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
                 if !isempty(readyToExecute)
                     # remove from highest index first so earlier deletes don't shift later indices
                     sort!(readyToExecute, by=x -> x[1], rev=true)
-                    for (i, toSkip, je) in readyToExecute
+                    for (ready_index, (i, toSkip, je)) in enumerate(readyToExecute)
                         deleteat!(scheduler.jobExecutions, i)
                         next = scheduleNextExecution!(scheduler, je.job)
+                        # The eligibility check can disable a job that expired while queued.
+                        if !toSkip && isdisabled(je.job)
+                            delete!(scheduler.executingJobExecutions, je)
+                            toSkip = true
+                            readyToExecute[ready_index] = (i, toSkip, je)
+                        end
                         resort |= next !== nothing
                         if scheduler.logging
                             if isdisabled(je.job)

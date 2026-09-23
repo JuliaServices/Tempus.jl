@@ -994,6 +994,34 @@ end
     @test sprint(show, history[1]) isa String
 end
 
+@testset "Queued jobs expire before dispatch" begin
+    for make_job in (Tempus.OneShotJob, (action, name; kw...) -> Tempus.Job(action, name, "* * * * * *"; kw...)),
+        use_scheduler_expiry in (false, true)
+        ran = Channel{Nothing}(1)
+        expiry = DateTime(2000, 1, 1)
+        scheduler = Tempus.Scheduler(; logging=false,
+            expires_at=use_scheduler_expiry ? expiry : nothing)
+        job = make_job(() -> put!(ran, nothing), "queued_expiry";
+            expires_at=use_scheduler_expiry ? nothing : expiry)
+        try
+            # Recreate a job whose deadline passed while it was queued. Holding
+            # the lock keeps dispatch from starting until this state is ready.
+            @lock scheduler.lock begin
+                Tempus.run!(scheduler; close_when_no_jobs=true)
+                Tempus.addJob!(scheduler.store, job)
+                push!(scheduler.jobExecutions, Tempus.JobExecution(job, expiry - Second(1)))
+            end
+            wait(scheduler)
+            @test !isready(ran)
+            @test Tempus.isdisabled(job)
+            @test isempty(Tempus.getNMostRecentJobExecutions(scheduler.store, job.name, 1))
+            @test isempty(scheduler.executingJobExecutions)
+        finally
+            close(scheduler)
+        end
+    end
+end
+
 @testset "unschedule!" begin
     store = Tempus.InMemoryStore()
     scheduler = Tempus.Scheduler(store; logging=false)
