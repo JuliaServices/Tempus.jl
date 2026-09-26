@@ -1068,4 +1068,5 @@ end
     close(scheduler; timeout=2)
 end
 
+include("dispatch_tests.jl")
 include("trim_compile_tests.jl")

@@ -550,8 +550,13 @@ With `close_when_no_jobs=true`, the loop shuts down on its own once no
 executions are queued or running (see [`runJobs!`](@ref)). Throws if the
 scheduler is already running or a previous timed-out close still has loop or
 job tasks in flight.
+
+A dispatch error stops the loop without canceling jobs that already started.
+Selected executions whose tasks were not started remain queued. Calling
+`run!` again rebuilds the queue from the stored jobs and their execution history.
 """
 function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
+    readyToExecute = Tuple{Int, Bool, JobExecution}[]
     scheduler.logging && @info "Starting scheduler and all jobs."
     @lock scheduler.lock begin
         scheduler.running && throw(ArgumentError("scheduler is already running; close it before calling run! again"))
@@ -577,7 +582,6 @@ function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
     end
     # start scheduler job execution task
     errormonitor(Threads.@spawn :interactive try
-        readyToExecute = Tuple{Int, Bool, JobExecution}[]
         while true
             empty!(readyToExecute)
             now = trunc(Dates.now(UTC), Second)
@@ -669,10 +673,7 @@ function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
             end
             filter!(x -> !x[2], readyToExecute)
             if !isempty(readyToExecute)
-                for (_, _, je) in readyToExecute
-                    # we're ready to execute a job!
-                    executeJob!(scheduler, je)
-                end
+                _launch_ready!(executeJob!, scheduler, readyToExecute)
             else
                 # @info "No jobs to execute, sleeping 500ms then checking again."
                 sleep(0.5)
@@ -684,12 +685,36 @@ function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
         # and finishing executions must be able to observe that (otherwise
         # `wait(scheduler)` never returns)
         @lock scheduler.lock begin
+            # Entries remain in the batch until task handoff succeeds. Return
+            # unlaunched work to the queue without releasing any running task.
+            if !isempty(readyToExecute)
+                for (_, toSkip, je) in readyToExecute
+                    toSkip && continue
+                    delete!(scheduler.executingJobExecutions, je)
+                    any(queued -> queued === je, scheduler.jobExecutions) ||
+                        push!(scheduler.jobExecutions, je)
+                end
+                sort!(scheduler.jobExecutions, by=je->je.scheduledStart)
+            end
             scheduler.running = false
             scheduler.loopActive = false
             isempty(scheduler.executingJobExecutions) && notify(scheduler.jobExecutionFinished)
         end
     end)
     return scheduler
+end
+
+# Preserve the batch's dispatch order while removing entries only after the
+# launcher has accepted them. On failure, the remaining entries still belong
+# to the dispatch loop and its cleanup can release their reservations.
+function _launch_ready!(launch::F, scheduler::Scheduler, readyToExecute) where {F}
+    reverse!(readyToExecute)
+    while !isempty(readyToExecute)
+        _, toSkip, je = last(readyToExecute)
+        toSkip || launch(scheduler, je)
+        pop!(readyToExecute)
+    end
+    return nothing
 end
 
 """
@@ -851,9 +876,13 @@ end
 """
     wait(scheduler::Scheduler)
 
-Waits for the scheduler to finish executing all jobs.
-Note the scheduler must be explicitly closed to stop the scheduler loop
-or pass `close_when_no_jobs=true` to `run!` to automatically close the scheduler when no jobs are left.
+Waits until the dispatch loop and all started job tasks have stopped. Close the
+scheduler explicitly, or pass `close_when_no_jobs=true` to `run!` to stop the
+loop automatically when no executions are queued or running.
+
+Returning does not mean every queued job ran: closing the scheduler or a
+dispatch error can leave unstarted executions queued. Background task errors
+are reported by the task error monitor; `wait(scheduler)` does not rethrow them.
 """
 Base.wait(scheduler::Scheduler) = wait(scheduler.jobExecutionFinished)
 
