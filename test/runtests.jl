@@ -589,6 +589,32 @@ end
     @test next isa Tempus.JobExecution
 end
 
+@testset "Execution caps with mixed outcomes" begin
+    for (success_cap, failure_cap, statuses, disabled) in (
+        (3, nothing, (:succeeded, :failed, :succeeded, :succeeded), true),
+        (3, nothing, (:succeeded, :failed, :succeeded), false),
+        (5, 2, (:failed, :failed, :succeeded), false),
+        (5, 2, (:succeeded, :failed, :failed), true),
+        (nothing, 2, (:failed, :succeeded, :failed), false),
+    )
+        store = Tempus.InMemoryStore()
+        job = Tempus.Job(() -> nothing, "mixed", "* * * * * *";
+            max_executions=success_cap, max_failed_executions=failure_cap)
+        Tempus.addJob!(store, job)
+        for (i, status) in enumerate(statuses)
+            execution = Tempus.JobExecution(job, DateTime(2026) + Second(i))
+            execution.actualStart = execution.scheduledStart
+            execution.finish = execution.scheduledStart
+            execution.status = status
+            execution.result = nothing
+            execution.exception = nothing
+            Tempus.storeJobExecution!(store, execution)
+        end
+        @test (Tempus.nextJobExecution(store, job; logging=false) === nothing) == disabled
+        @test Tempus.isdisabled(get(store.jobs, job.name, nothing)) == disabled
+    end
+end
+
 @testset "Queue scheduling dedupe regression" begin
     started = Channel{Nothing}(10)
     release = Channel{Nothing}(10)
