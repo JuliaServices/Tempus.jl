@@ -1116,33 +1116,38 @@ end
 Closes the scheduler, stopping job execution; waits up to `timeout` seconds
 (5 by default) for any currently executing jobs to finish before returning.
 """
-function Base.close(scheduler::Scheduler; timeout::Real=5)
+function Base.close(@nospecialize(scheduler::Scheduler); timeout::Real=5)
+    # Unspecialized, so one compiled method closes a scheduler of any store type, even one
+    # held in an abstractly typed field. It reads and writes fields with the `getfield` and
+    # `setfield!` builtins and captures the scheduler in no closure, so every call stays static.
     isfinite(timeout) && timeout >= 0 ||
         throw(ArgumentError("timeout must be a finite non-negative number, got $timeout"))
-    scheduler.logging && @info "Closing scheduler and waiting $(timeout)s for job executions to stop."
-    @lock scheduler.lock begin
-        scheduler.running = false
-        if !scheduler.loopActive && isempty(scheduler.executingJobExecutions)
-            notify(scheduler.jobExecutionFinished)
-        end
+    lk = getfield(scheduler, :lock)
+    logging = getfield(scheduler, :logging)
+    logging && @info "Closing scheduler and waiting $(timeout)s for job executions to stop."
+    @lock lk begin
+        setfield!(scheduler, :running, false)
+        _stopped(scheduler) && notify(getfield(scheduler, :jobExecutionFinished))
     end
 
     # Do not notify jobExecutionFinished on timeout. That event means the loop
     # and every execution are actually finished; using it as a timeout signal
     # makes wait(scheduler) lie and permits an unsafe restart of active work.
-    status = Base.timedwait(
-        () -> (@lock scheduler.lock begin
-            !scheduler.loopActive && isempty(scheduler.executingJobExecutions)
-        end),
-        timeout,
-    )
-    if status == :timed_out
-        scheduler.logging && @warn "Scheduler closing timeout reached, returning without waiting for job executions to finish."
-    else
-        scheduler.logging && @info "Scheduler closed and job execution stopped."
+    deadline = time() + timeout
+    while !(@lock lk _stopped(scheduler))
+        if time() >= deadline
+            logging && @warn "Scheduler closing timeout reached, returning without waiting for job executions to finish."
+            return
+        end
+        sleep(0.1)
     end
+    logging && @info "Scheduler closed and job execution stopped."
     return
 end
+
+# Whether the dispatch loop and every job execution have stopped. Hold the lock.
+_stopped(@nospecialize(scheduler::Scheduler)) =
+    !getfield(scheduler, :loopActive) && isempty(getfield(scheduler, :executingJobExecutions))
 
 """
     wait(scheduler::Scheduler)

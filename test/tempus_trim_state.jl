@@ -29,6 +29,9 @@ struct EventRuntime
     scheduler::Tempus.Scheduler
 end
 
+# A function barrier: inside it, only the field's abstract type is known.
+@noinline stop!(runtime::EventRuntime) = close(runtime.scheduler)
+
 function trim_assert(condition::Bool, message::String)::Nothing
     condition || error(message)
     return nothing
@@ -95,7 +98,7 @@ function trim_scheduler(directory::String)::Nothing
     store, scheduler = start_jobs!(backend, state)
     runtime = EventRuntime(scheduler)
     wait_for(state.ticks, state.ticks[] + 1)
-    close(runtime.scheduler)
+    stop!(runtime)
 
     trim_assert(length(Tempus.getJobs(store)) == 3, "persisted jobs")
     history = Tempus.getNMostRecentJobExecutions(store, TICK_JOB, 10)
