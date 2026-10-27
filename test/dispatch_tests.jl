@@ -1,5 +1,5 @@
-mutable struct DispatchFaultHistory <: AbstractStore{Vector{Tempus.JobExecution}}
-    backing::MemoryStore{Vector{Tempus.JobExecution}}
+mutable struct DispatchFaultHistory <: AbstractStore{Vector{Tempus.JobExecutionRecord}}
+    backing::MemoryStore{Vector{Tempus.JobExecutionRecord}}
     reads::Int
     fail_on::Int
     exception::ErrorException
@@ -25,9 +25,9 @@ AbstractStores.modify!(f, history::DispatchFaultHistory, key::AbstractString; kw
         ((1, false, false), (2, false, false), (1, true, false),
          (2, true, false), (1, true, true))
         @testset "history read $failure_index, prior=$with_prior, overlap=$overlap" begin
-            history = DispatchFaultHistory(MemoryStore{Vector{Tempus.JobExecution}}(),
+            history = DispatchFaultHistory(MemoryStore{Vector{Tempus.JobExecutionRecord}}(),
                 0, 0, ErrorException("dispatch history unavailable"), nothing)
-            store = Tempus.Store(MemoryStore{Tempus.Job}(), history)
+            store = Tempus.Store(MemoryStore{Tempus.JobRecord}(), history)
             scheduler = Tempus.Scheduler(store; logging=false,
                 max_concurrent_executions=4, overlap_policy=:queue)
             started = Channel{Nothing}(1)
@@ -105,7 +105,7 @@ AbstractStores.modify!(f, history::DispatchFaultHistory, key::AbstractString; kw
                 for je in pending
                     executions = Tempus.getNMostRecentJobExecutions(store, je.job.name, 10)
                     @test length(executions) == 1
-                    @test only(executions).status == :succeeded
+                    @test only(executions).succeeded
                 end
                 if with_prior
                     @test length(Tempus.getNMostRecentJobExecutions(store, prior.name, 10)) == 1
