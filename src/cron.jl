@@ -250,6 +250,12 @@ function parseCron(cron::AbstractString)
     if !valid(Month, month)
         throw(ArgumentError("Invalid month value: $month"))
     end
+    # "0 0 30 2 *" never fires. Reject it here: once stored, a job with such a
+    # schedule makes push! and every later run! on that store throw.
+    if day_of_week isa Wildcard && !any(allowed(Day(d), day) && allowed(Month(m), month)
+                                        for m in 1:12 for d in 1:daysinmonth(2024, m))  # 2024 has Feb 29
+        throw(ArgumentError("Invalid cron expression, no allowed month has that day of month: $cron"))
+    end
     return Cron(second, minute, hour, day, month, day_of_week)
 end
 

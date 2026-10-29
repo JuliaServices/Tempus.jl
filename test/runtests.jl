@@ -770,8 +770,10 @@ end
     @test getnext(parseCron("30 * * * *"), DateTime(2021, 1, 15, 23, 45, 0)) == DateTime(2021, 1, 16, 0, 30, 0)  # "Hour: 24 out of range"
     @test getnext(parseCron("30 * * * * *"), DateTime(2021, 1, 15, 23, 59, 45)) == DateTime(2021, 1, 16, 0, 0, 30)  # "Minute: 60 out of range"
     @test getnext(parseCron("0 0 29 2 *"), DateTime(2021, 3, 1)) == DateTime(2024, 2, 29)  # multi-year day search
-    # an expression that can never fire is a bounded error, not an infinite loop
-    @test_throws ArgumentError getnext(parseCron("0 0 30 2 *"), DateTime(2021, 1, 1))
+    # a schedule that can never fire is a bounded error, not an infinite loop
+    # (parseCron rejects it, so build it directly)
+    feb30 = Tempus.Cron(Tempus.Numeric(0), Tempus.Numeric(0), Tempus.Numeric(0), Tempus.Numeric(30), Tempus.Numeric(2), Tempus.Wildcard())
+    @test_throws ArgumentError getnext(feb30, DateTime(2021, 1, 1))
 end
 
 @testset "Step field semantics" begin
@@ -815,6 +817,18 @@ end
     @test_throws ArgumentError parseCron("0 0 * * MONDAY-FRI")
     @test_throws ArgumentError parseCron("0 0 * * FRI-MON")
     @test_throws ArgumentError parseCron("* * * * 8")
+end
+
+@testset "Never-firing schedules are rejected" begin
+    # a stored job whose schedule never fires made push! and every later run! throw
+    for expr in ("0 0 30 2 *", "0 0 31 4,6,9,11 *", "0 0 30-31 FEB *")
+        @test_throws ArgumentError parseCron(expr)
+        @test_throws ArgumentError Tempus.Job(() -> nothing, "never", expr)
+    end
+    # a restricted day of week also matches (cron's OR), and Feb 29 exists in leap years
+    @test getnext(parseCron("0 0 30 2 1"), DateTime(2026, 1, 1)) == DateTime(2026, 2, 2)
+    @test getnext(parseCron("0 0 29 2 *"), DateTime(2026, 1, 1)) == DateTime(2028, 2, 29)
+    @test getnext(parseCron("0 0 31 4-5 *"), DateTime(2026, 1, 1)) == DateTime(2026, 5, 31)
 end
 
 @testset "close timeout failsafe" begin
