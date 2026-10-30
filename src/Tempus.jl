@@ -21,16 +21,88 @@ include("cron.jl")
 _some(x, y...) = x === nothing ? _some(y...) : x
 _some(x) = x
 
-"""
-    Store
+# Job actions, retry checks, and timezone schedule lookups are stored behind one
+# concrete type each, so the scheduler calls them without dynamic dispatch (which binaries compiled with
+# `juliac --trim` do not have). A `Callback{C}` holds a `@cfunction` pointer
+# specialized on the callable's type plus a pointer to the callable; calling it
+# is a fixed-signature `ccall` that passes a concrete `C` record carrying the
+# arguments and the result. Calls through the pointer run in the latest world.
+#
+# The type is mutable because Julia stores the `Ptr` fields of mutable objects
+# as `C_NULL` in package images: a callback built during precompilation then
+# fails with an error instead of calling through a stale pointer.
+mutable struct Callback{C}
+    ptr::Ptr{Cvoid}
+    objptr::Ptr{Cvoid}
+    const root::Any # keeps the callable alive; never dispatched on
+end
 
-Two typed `AbstractStore` views used by a scheduler: jobs by name and bounded
-execution history by job name. Applications choose the shared backend.
-"""
-struct Store{J<:AbstractStores.AbstractStore,E<:AbstractStores.AbstractStore}
-    jobs::J
-    executions::E
-    history_limit::Int
+struct CallbackWrapper{C} <: Function end
+
+function (::CallbackWrapper{C})(f::F, callptr::Ptr{Cvoid}) where {C, F}
+    invokecallback!(f, unsafe_pointer_to_objref(callptr)::C)
+    return nothing
+end
+
+@generated function callbackptr(::Type{C}, ::Type{F}) where {C, F}
+    return :(@cfunction($(CallbackWrapper{C}()), Cvoid, (Ref{$F}, Ptr{Cvoid})))
+end
+
+function Callback{C}(f::F) where {C, F}
+    root = Base.cconvert(Ref{F}, f)
+    objptr = Ptr{Cvoid}(Base.unsafe_convert(Ref{F}, root))
+    return Callback{C}(callbackptr(C, F), objptr, root)
+end
+
+Callback{C}(f::Callback{C}) where {C} = f
+
+function (f::Callback{C})(call::C) where {C}
+    f.ptr == C_NULL && throw(ArgumentError(
+        "this Tempus job or job option was created during precompilation; create it at run time"))
+    GC.@preserve f call begin
+        ccall(f.ptr, Cvoid, (Ptr{Cvoid}, Ptr{Cvoid}), f.objptr, pointer_from_objref(call))
+    end
+    return call
+end
+
+# a job action call: `action()`
+mutable struct ActionCall
+    result::Any
+    ActionCall() = new(nothing)
+end
+
+invokecallback!(f, call::ActionCall) = (call.result = f(); nothing)
+
+const JobAction = Callback{ActionCall}
+
+(action::JobAction)() = action(ActionCall()).result
+
+# a retry check call: `retry_check(state, exception)::Bool`, where `state` is
+# the `Base.ExponentialBackOff` iteration state `Base.retry` passes
+mutable struct RetryCheckCall
+    const state::Tuple{Int, Float64}
+    const exception::Any
+    retry::Bool
+    RetryCheckCall(state, exception) = new(state, exception, false)
+end
+
+invokecallback!(f, call::RetryCheckCall) = (call.retry = f(call.state, call.exception)::Bool; nothing)
+
+# a timezone-aware schedule lookup: `getnext(cron, timezone, from)`. Kept behind
+# a callback so TimeZones' database loading, which is not trim-safe, is only
+# compiled into programs that create jobs with a `timezone`.
+mutable struct NextTimeCall
+    const cron::Cron
+    const from::DateTime
+    next::DateTime
+    NextTimeCall(cron, from) = new(cron, from)
+end
+
+invokecallback!(f, call::NextTimeCall) = (call.next = f(call.cron, call.from)::DateTime; nothing)
+
+function zonecallback(timezone::String)
+    TimeZones.istimezone(timezone) || throw(ArgumentError("unknown timezone: $(repr(timezone))"))
+    return Callback{NextTimeCall}((cron, from) -> getnext(cron, timezone, from))
 end
 
 """
@@ -42,40 +114,63 @@ Defines options for job execution behavior.
 - `overlap_policy::Union{Symbol, Nothing}`: Determines job execution behavior when the same job is already running (`:skip`, `:queue`, `:concurrent`).
 - `retries::Int`: Number of retries allowed on failure.
 - `retry_delays::Union{Base.ExponentialBackOff, Nothing}`: Delay strategy for retries (defaults to exponential backoff if `retries > 0`).
-- `retry_check`: Custom function to determine retry behavior (`check` argument from `Base.retry`).
+- `retry_check`: Custom function `(state, exception) -> Bool` deciding whether a failed attempt is retried (the `check` argument of `Base.retry`); stored as an internal callback wrapper. In a binary compiled with `juliac --trim`, declare its exception argument `@nospecialize`.
 - `max_failed_executions::Union{Int, Nothing}`: Number of consecutive failed executions that disables a job.
 - `max_executions::Union{Int, Nothing}`: Maximum number of successful executions in the retained history.
 - `expires_at::Union{DateTime, Nothing}`: Expiration time for a job.
 - `timezone::Union{Nothing, String}`: IANA timezone name (e.g. `"America/Denver"`). When set, the job's cron schedule is interpreted in this timezone. `nothing` means UTC.
+- `zone`: Internal callback computing the next UTC time of a schedule in `timezone`; `nothing` without a timezone, and for options read back from a store record (see [`restoreJobs!`](@ref)).
 """
-@kwdef struct JobOptions
-    overlap_policy::Union{Symbol, Nothing} = nothing # :skip, :queue, :concurrent
-    retries::Int = 0
-    retry_delays::Union{Base.ExponentialBackOff, Nothing} = retries > 0 ? Base.ExponentialBackOff(; n=retries) : nothing # see Base.ExponentialBackOff
-    retry_check = nothing # see Base.retry `check` keyword argument
-    max_failed_executions::Union{Int, Nothing} = nothing # max number of failed executions allowed for a job before it will be disabled
-    max_executions::Union{Int, Nothing} = nothing # max number of _successful_ executions job is allowed to run
-    expires_at::Union{DateTime, Nothing} = nothing # expiration time for job
-    timezone::Union{Nothing, String} = nothing # IANA timezone, e.g. "America/Denver"
+struct JobOptions
+    overlap_policy::Union{Symbol, Nothing} # :skip, :queue, :concurrent
+    retries::Int
+    retry_delays::Union{Base.ExponentialBackOff, Nothing} # see Base.ExponentialBackOff
+    retry_check::Union{Nothing, Callback{RetryCheckCall}} # see Base.retry `check` keyword argument
+    max_failed_executions::Union{Int, Nothing} # max number of failed executions allowed for a job before it will be disabled
+    max_executions::Union{Int, Nothing} # max number of _successful_ executions job is allowed to run
+    expires_at::Union{DateTime, Nothing} # expiration time for job
+    timezone::Union{Nothing, String} # IANA timezone, e.g. "America/Denver"
+    zone::Union{Nothing, Callback{NextTimeCall}}
 
     # validate at construction: a bad option caught here fails the Job/Scheduler
     # definition, rather than misbehaving inside the scheduler loop later (an
-    # unrecognized overlap_policy would leave ready executions queued forever,
-    # and a bad timezone would throw while computing the next execution)
-    function JobOptions(overlap_policy, retries, retry_delays, retry_check,
-                        max_failed_executions, max_executions, expires_at, timezone)
+    # unrecognized overlap_policy would leave ready executions queued forever).
+    # `@nospecialize` keeps one compiled method for every combination of the
+    # union-typed options (for example when rebuilding options from a record).
+    function JobOptions(@nospecialize(overlap_policy::Union{Symbol, Nothing}), retries::Int,
+                        @nospecialize(retry_delays::Union{Base.ExponentialBackOff, Nothing}),
+                        @nospecialize(retry_check::Union{Nothing, Callback{RetryCheckCall}}),
+                        @nospecialize(max_failed_executions::Union{Int, Nothing}),
+                        @nospecialize(max_executions::Union{Int, Nothing}),
+                        @nospecialize(expires_at::Union{DateTime, Nothing}),
+                        @nospecialize(timezone::Union{Nothing, String}),
+                        @nospecialize(zone::Union{Nothing, Callback{NextTimeCall}}))
         overlap_policy === nothing || overlap_policy in (:skip, :queue, :concurrent) ||
-            throw(ArgumentError("overlap_policy must be :skip, :queue, or :concurrent, got $(repr(overlap_policy))"))
+            throw(ArgumentError("overlap_policy must be :skip, :queue, or :concurrent, got :$overlap_policy"))
         retries >= 0 || throw(ArgumentError("retries must be non-negative, got $retries"))
         max_failed_executions === nothing || max_failed_executions > 0 ||
             throw(ArgumentError("max_failed_executions must be positive, got $max_failed_executions"))
         max_executions === nothing || max_executions > 0 ||
             throw(ArgumentError("max_executions must be positive, got $max_executions"))
-        timezone === nothing || TimeZones.istimezone(timezone) ||
-            throw(ArgumentError("unknown timezone: $(repr(timezone))"))
         return new(overlap_policy, retries, retry_delays, retry_check,
-                   max_failed_executions, max_executions, expires_at, timezone)
+                   max_failed_executions, max_executions, expires_at, timezone, zone)
     end
+end
+
+# `retry_check::R`: a function argument the method only passes along would not
+# be specialized on, leaving the callback construction dynamically dispatched
+function JobOptions(; overlap_policy=nothing, retries=0,
+        retry_delays=retries > 0 ? Base.ExponentialBackOff(; n=retries) : nothing,
+        retry_check::R=nothing, max_failed_executions=nothing, max_executions=nothing,
+        expires_at=nothing, timezone=nothing) where {R}
+    check = retry_check === nothing ? nothing : Callback{RetryCheckCall}(retry_check)
+    tz = timezone === nothing ? nothing : String(timezone)
+    return JobOptions(convert(Union{Symbol, Nothing}, overlap_policy), convert(Int, retries),
+                      convert(Union{Base.ExponentialBackOff, Nothing}, retry_delays), check,
+                      convert(Union{Int, Nothing}, max_failed_executions),
+                      convert(Union{Int, Nothing}, max_executions),
+                      convert(Union{DateTime, Nothing}, expires_at),
+                      tz, tz === nothing ? nothing : zonecallback(tz))
 end
 
 Base.show(io::IO, opts::JobOptions) = print(io, "Tempus.JobOptions(overlap_policy=$(opts.overlap_policy), retries=$(opts.retries), max_failed_executions=$(opts.max_failed_executions), max_executions=$(opts.max_executions), expires_at=$(opts.expires_at), timezone=$(opts.timezone))")
@@ -88,15 +183,21 @@ Represents a single job/unit of work. Can be scheduled to repeat.
 # Fields:
 - `name::String`: Unique identifier for the job.
 - `schedule::Union{Cron, Nothing}`: The cron-style schedule expression.
-- `action::Function`: The function to execute when the job runs.
-- `action_ref::Union{Nothing, String}`: Fully qualified function reference for persistence (e.g. `"MyModule.my_handler"`).
-- `action_data::Union{Nothing, String}`: JSON-encoded parameters for persistence. Splatted as kwargs: `action(; JSON.parse(action_data)...)`.
+- `action`: The function to execute when the job runs, behind an internal callback wrapper (call it as `job.action()`); `nothing` for a job read from a store that was not added in this process (see [`addJob!`](@ref)).
+- `action_ref::Union{Nothing, String}`: Fully qualified function reference (e.g. `"MyModule.my_handler"`), used by [`restoreJobs!`](@ref).
+- `action_data::Union{Nothing, String}`: JSON-encoded `job_params`, passed to the action as keyword arguments: `action(; JSON.parse(action_data)...)`.
 - `options::JobOptions`: Execution options for retries, failures, and overlap handling.
 - `disabledAt::Union{DateTime, Nothing}`: Timestamp when the job was disabled (if applicable).
+
+Create jobs at run time (for example in a package's `__init__`), not during
+precompilation: the action wrapper is not valid in another Julia session.
+`job_params` are converted to keyword arguments from JSON at every call, which
+binaries compiled with `juliac --trim` cannot do; there, capture parameters in
+the action instead (`Job(() -> handler(; value="x"), ...)`).
 """
 mutable struct Job
     const lock::ReentrantLock
-    const action::Function
+    const action::Union{Nothing, JobAction}
     const action_ref::Union{Nothing, String}
     const action_data::Union{Nothing, String}
     const name::String
@@ -106,12 +207,11 @@ mutable struct Job
     disabledAt::Union{DateTime, Nothing}
 end
 
-function Job(action::Function, name, schedule;
-        job_params=nothing, action_ref::Union{Nothing,String}=nothing, kw...)
-    ref = action_ref !== nothing ? action_ref : _function_ref(action)
-    data = job_params === nothing ? nothing : JSON.json(job_params)
+function Job(action::F, name, schedule;
+        job_params=nothing, action_ref::Union{Nothing,String}=nothing, kw...) where {F<:Function}
     schedule_parsed = schedule isa Cron ? schedule : parseCron(schedule)
-    Job(ReentrantLock(), action, ref, data, string(name), schedule_parsed, JobOptions(; kw...), nothing)
+    data = job_params === nothing ? nothing : JSON.json(job_params)
+    return Job(action, string(name), schedule_parsed, action_ref, data, JobOptions(; kw...))
 end
 
 """
@@ -127,29 +227,42 @@ Note the run-once bookkeeping is based on the job's stored execution history,
 so re-adding a one-shot job whose name has already succeeded will not run it
 again; use a fresh name (or [`purgeJob!`](@ref)) to re-run one.
 """
-function OneShotJob(action::Function, name;
-        job_params=nothing, action_ref::Union{Nothing,String}=nothing, kw...)
-    ref = action_ref !== nothing ? action_ref : _function_ref(action)
+function OneShotJob(action::F, name;
+        job_params=nothing, action_ref::Union{Nothing,String}=nothing, kw...) where {F<:Function}
     data = job_params === nothing ? nothing : JSON.json(job_params)
-    Job(ReentrantLock(), action, ref, data, string(name), nothing, JobOptions(; kw..., max_executions=1), nothing)
+    return Job(action, string(name), nothing, action_ref, data, JobOptions(; kw..., max_executions=1))
+end
+
+function Job(f::F, name::String, schedule::Union{Cron, Nothing}, action_ref::Union{Nothing, String},
+             data::Union{Nothing, String}, options::JobOptions) where {F<:Function}
+    ref = action_ref !== nothing ? action_ref : _function_ref(f)
+    action = data === nothing ? JobAction(f) : JobAction(() -> f(; JSON.parse(data)...))
+    return Job(ReentrantLock(), action, ref, data, name, schedule, options, nothing)
 end
 
 """Auto-extract fully qualified function reference string from a named function."""
-function _function_ref(f::Function)
-    fname = nameof(f)
-    # Detect anonymous functions (can't be persisted)
-    startswith(string(fname), '#') && return nothing
-    mod_path = Base.fullname(parentmodule(f))
-    parts = mod_path[1] == :Main ? mod_path[2:end] : mod_path
-    isempty(parts) && return string(fname)
-    return join([parts..., fname], '.')
+function _function_ref(f::F) where {F<:Function}
+    name = String(nameof(f))
+    # anonymous functions cannot be resolved by name
+    startswith(name, '#') && return nothing
+    parts = [name]
+    # module path, outermost first; `Main` is left out (bare names resolve there)
+    m = parentmodule(f)
+    while m !== Main
+        pushfirst!(parts, String(nameof(m)))
+        parent = parentmodule(m)
+        parent === m && break
+        m = parent
+    end
+    return join(parts, '.')
 end
 
 """
     resolve_function(ref::String) -> Function
 
 Resolve a function from its fully qualified reference string (e.g. `"MyModule.my_handler"`).
-The module must be loaded before calling this function.
+The module must be loaded before calling this function. This uses reflection,
+so it is unavailable in binaries compiled with `juliac --trim`.
 """
 function resolve_function(ref::String)
     parts = Symbol.(split(ref, '.'))
@@ -185,6 +298,36 @@ function Base.show(io::IO, job::Job)
     return
 end
 
+"""
+    Store
+
+Two typed `AbstractStore` views used by a scheduler, jobs by name
+([`JobRecord`](@ref)s) and bounded execution history by job name
+([`JobExecutionRecord`](@ref)s), plus the actions of the jobs added to this
+`Store` object in this process. Applications choose the shared backend.
+
+Actions are not persisted. A scheduler runs a stored job only when a job of
+that name was added in this process with [`addJob!`](@ref) or `push!`; add each
+job at startup, or call [`restoreJobs!`](@ref) to resolve stored jobs' actions
+by name.
+"""
+struct Store{J<:AbstractStores.AbstractStore,E<:AbstractStores.AbstractStore}
+    jobs::J
+    executions::E
+    history_limit::Int
+    added::Dict{String, Job} # jobs added in this process, by name; they supply the actions
+    lock::ReentrantLock # guards `added`
+end
+
+Store(jobs::J, executions::E, history_limit::Int) where {J, E} =
+    Store{J, E}(jobs, executions, history_limit, Dict{String, Job}(), ReentrantLock())
+
+# A view's values have its element type, but not every backend's `get` infers
+# it (an untyped `MemoryStore` returns `Any`); assert it so code using the
+# value stays statically dispatched.
+_get(view::AbstractStores.AbstractStore{T}, key::AbstractString) where {T} =
+    get(view, key, nothing)::Union{Nothing, T}
+
 nextJobExecution(scheduler, job::Job) =
     nextJobExecution(
         scheduler.store,
@@ -203,7 +346,10 @@ and return a `JobExecution` for the next time it should run, or `nothing` if
 the job shouldn't be scheduled again. As a side effect, jobs that have expired
 or reached their execution caps are disabled in the store.
 """
-function nextJobExecution(store::Store, job::Job, max_failed_executions=job.options.max_failed_executions, max_executions=job.options.max_executions, expires_at=job.options.expires_at; logging::Bool=true)
+function nextJobExecution(store::Store, job::Job,
+        @nospecialize(max_failed_executions::Union{Int, Nothing}=job.options.max_failed_executions),
+        @nospecialize(max_executions::Union{Int, Nothing}=job.options.max_executions),
+        @nospecialize(expires_at::Union{DateTime, Nothing}=job.options.expires_at); logging::Bool=true)
     # if job is already disabled, return nothing
     isdisabled(job) && return nothing
     # check if job has expired
@@ -216,7 +362,7 @@ function nextJobExecution(store::Store, job::Job, max_failed_executions=job.opti
     nexecs = max_executions === nothing ? something(max_failed_executions, 0) : store.history_limit
     execs = getNMostRecentJobExecutions(store, job.name, nexecs)
     # check if max number of executions has been reached
-    if max_executions !== nothing && count(e -> e.status == :succeeded, execs) >= max_executions
+    if max_executions !== nothing && count(e -> e.succeeded, execs) >= max_executions
         logging && @info "Disabling job $(job.name) after reaching maximum number of successful executions: $(max_executions)."
         disableJob!(store, job)
         return nothing
@@ -225,18 +371,20 @@ function nextJobExecution(store::Store, job::Job, max_failed_executions=job.opti
     if max_failed_executions !== nothing
         execs = @view execs[1:min(max_failed_executions, length(execs))]
     end
-    if max_failed_executions !== nothing && count(e -> e.status == :failed, execs) >= max_failed_executions
+    if max_failed_executions !== nothing && count(e -> !e.succeeded, execs) >= max_failed_executions
         logging && @info "Disabling job $(job.name) after reaching maximum number of failed executions: $(max_failed_executions)."
         disableJob!(store, job)
         return nothing
     end
-    tz = job.options.timezone
+    zone = job.options.zone
     time = if job.schedule === nothing
         Dates.now(UTC)
-    elseif tz !== nothing
-        getnext(job.schedule, tz)
-    else
+    elseif job.options.timezone === nothing
         getnext(job.schedule)
+    elseif zone !== nothing
+        zone(NextTimeCall(job.schedule, Dates.now(UTC))).next
+    else
+        throw(ArgumentError("job $(job.name) was read from a store record without its timezone schedule; add the job again or call `Tempus.restoreJobs!`"))
     end
     return JobExecution(job, time)
 end
@@ -246,7 +394,7 @@ end
 
 Disables a job, preventing it from being scheduled for execution.
 
-This mutates the `Job` object only. A persisting store holds a *copy* of the job,
+This mutates the `Job` object only. A store keeps its own record of the job,
 so use [`disableJob!`](@ref)`(store, job)` when the change must survive a
 restart.
 """
@@ -296,7 +444,11 @@ mutable struct JobExecution
     status::Symbol # :succeeded, :failed
     result::Any
     exception::Union{Exception, Nothing}
-    JobExecution(job::Job, scheduledStart::DateTime) = new("$(job.name)-$scheduledStart", job, scheduledStart, false)
+    # second precision: Julia 1.13's trim verifier rejects the millisecond
+    # formatting `string(::DateTime)` would include
+    JobExecution(job::Job, scheduledStart::DateTime) = new(
+        string(job.name, '-', Dates.format(scheduledStart, dateformat"yyyy-mm-dd\THH:MM:SS")),
+        job, scheduledStart, false)
 end
 
 Base.hash(je::JobExecution, h::UInt) = hash(je.jobExecutionId, h)
@@ -316,18 +468,72 @@ function Base.show(io::IO, je::JobExecution)
 end
 
 """
+    JobRecord
+
+What a [`Store`](@ref) persists for a [`Job`](@ref): its definition and disabled
+state, without the action, which exists only in the process that added the job.
+`schedule` is the cron expression (`nothing` for one-shot jobs); the option
+fields are those of [`JobOptions`](@ref) except `retry_check` and `zone`, with
+`overlap_policy` as a string.
+"""
+struct JobRecord
+    name::String
+    schedule::Union{Nothing, String}
+    action_ref::Union{Nothing, String}
+    action_data::Union{Nothing, String}
+    overlap_policy::Union{Nothing, String}
+    retries::Int
+    retry_delays::Union{Nothing, Base.ExponentialBackOff}
+    max_failed_executions::Union{Nothing, Int}
+    max_executions::Union{Nothing, Int}
+    expires_at::Union{Nothing, DateTime}
+    timezone::Union{Nothing, String}
+    disabledAt::Union{Nothing, DateTime}
+end
+
+function JobRecord(job::Job)
+    disabledAt = @lock job.lock job.disabledAt
+    o = job.options
+    schedule = job.schedule === nothing ? nothing : cronstring(job.schedule)
+    policy = o.overlap_policy === nothing ? nothing : String(o.overlap_policy)
+    return JobRecord(job.name, schedule, job.action_ref, job.action_data, policy,
+                     o.retries, o.retry_delays, o.max_failed_executions, o.max_executions,
+                     o.expires_at, o.timezone, disabledAt)
+end
+
+"""
+    JobExecutionRecord
+
+What a [`Store`](@ref) persists for a finished [`JobExecution`](@ref): its id,
+timing, and whether it `succeeded` (its `status` was `:succeeded`). The value
+an action returned and the exception it threw are kept only on the in-process
+`JobExecution`.
+"""
+struct JobExecutionRecord
+    jobExecutionId::String
+    scheduledStart::DateTime
+    runConcurrently::Bool
+    actualStart::DateTime
+    finish::DateTime
+    succeeded::Bool
+end
+
+isdisabled(r::JobRecord) = r.disabledAt !== nothing
+
+JobExecutionRecord(e::JobExecution) = JobExecutionRecord(e.jobExecutionId, e.scheduledStart,
+    e.runConcurrently, e.actualStart, e.finish, e.status == :succeeded)
+
+"""
     Store(backend; prefix="tempus/", history_limit=100)
 
 Create job and execution-history views over one `AbstractStore` backend.
 Namespacing lets Tempus share a physical store with other libraries and
 application state.
 
-The backend must accept both `Job` and `Vector{JobExecution}` values — i.e. be an
-`AbstractStore{Any}` — and it must return them *as those types*. That rules out
-codecs that decode at the backend's own `eltype`: `FileStore{Any}(dir;
-codec=JSONCodec())` hands back `Dict{String,Any}`, not a `Job`. Use a
-type-preserving backend (`MemoryStore()`, or any store with the default
-`SerializedCodec`), or pass separately typed stores to `Store(jobs, executions)`.
+The backend must accept both `JobRecord` and `Vector{JobExecutionRecord}`
+values, i.e. be an `AbstractStore{Any}`. A serializing backend can use
+`SerializedCodec` or `JSONCodec`; JSON needs AbstractStores 0.2 or later, which
+decodes through the views' concrete types.
 
 `history_limit` bounds the execution history kept per job. Note that
 `max_executions`/`max_failed_executions` are evaluated against that history, so a
@@ -339,15 +545,15 @@ function Store(
     history_limit::Int=100,
 )
     history_limit > 0 || throw(ArgumentError("history_limit must be positive"))
-    (Job <: eltype(backend) && Vector{JobExecution} <: eltype(backend)) || throw(ArgumentError(
-        "a Tempus store needs a backend holding both `Tempus.Job` and " *
-        "`Vector{Tempus.JobExecution}` values, but `eltype(backend)` is $(eltype(backend)). " *
+    (JobRecord <: eltype(backend) && Vector{JobExecutionRecord} <: eltype(backend)) || throw(ArgumentError(
+        "a Tempus store needs a backend holding both `Tempus.JobRecord` and " *
+        "`Vector{Tempus.JobExecutionRecord}` values, but `eltype(backend)` is $(eltype(backend)). " *
         "Use an `AbstractStore{Any}` (`MemoryStore()`, `FileStore(dir)`, `SQLStore{Any}(conn)`), " *
         "or pass separately typed stores to `Tempus.Store(jobs, executions)`."))
     AbstractStores.checkstore(backend; listing=true)
     return Store(
-        AbstractStores.PrefixedStore{Job}(backend, string(prefix, "jobs/")),
-        AbstractStores.PrefixedStore{Vector{JobExecution}}(
+        AbstractStores.PrefixedStore{JobRecord}(backend, string(prefix, "jobs/")),
+        AbstractStores.PrefixedStore{Vector{JobExecutionRecord}}(
             backend,
             string(prefix, "executions/"),
         ),
@@ -361,8 +567,8 @@ end
 Create a store from separate typed job and execution-history backends.
 """
 function Store(
-    jobs::AbstractStores.AbstractStore{Job},
-    executions::AbstractStores.AbstractStore{Vector{JobExecution}};
+    jobs::AbstractStores.AbstractStore{JobRecord},
+    executions::AbstractStores.AbstractStore{Vector{JobExecutionRecord}};
     history_limit::Int=100,
 )
     history_limit > 0 || throw(ArgumentError("history_limit must be positive"))
@@ -394,21 +600,78 @@ function SQLiteStore(connection; table::AbstractString="tempus_state", kw...)
     return Store(backend; kw...)
 end
 
-"""Return every stored job, regardless of disabled status."""
+# The job a stored record describes: the job added under its name in this
+# process, with the record's disabled state, or else a job rebuilt from the
+# record without an action.
+function Job(store::Store, record::JobRecord)
+    added = @lock store.lock get(store.added, record.name, nothing)
+    added === nothing || return Job(ReentrantLock(), added.action, added.action_ref,
+        added.action_data, added.name, added.schedule, added.options, record.disabledAt)
+    schedule = record.schedule === nothing ? nothing : parseCron(record.schedule)
+    policy = record.overlap_policy === nothing ? nothing : Symbol(record.overlap_policy)
+    options = JobOptions(policy, record.retries, record.retry_delays, nothing,
+        record.max_failed_executions, record.max_executions, record.expires_at, record.timezone, nothing)
+    return Job(ReentrantLock(), nothing, record.action_ref, record.action_data,
+        record.name, schedule, options, record.disabledAt)
+end
+
+"""
+    getJobs(store) -> Vector{Job}
+
+Return every stored job, regardless of disabled status. A job added to `store`
+in this process carries its action; any other stored job has `action === nothing`.
+"""
 function getJobs(store::Store)
     jobs = Job[]
     for name in keys(store.jobs)
         # a concurrent `purgeJob!` can remove a key between listing and fetching
-        job = get(store.jobs, name, nothing)
-        job === nothing || push!(jobs, job)
+        record = _get(store.jobs, name)
+        record === nothing || push!(jobs, Job(store, record))
     end
     return jobs
 end
 
-"""Add or replace a job by name."""
+"""
+    addJob!(store, job)
+
+Add or replace a job by name. The job's definition is persisted; its action is
+kept in `store` for this process, so add every job again after a restart (or
+call [`restoreJobs!`](@ref)) for a scheduler to run it.
+"""
 function addJob!(store::Store, job::Job)
-    put!(store.jobs, job.name, job)
+    put!(store.jobs, job.name, JobRecord(job))
+    job.action === nothing || @lock store.lock (store.added[job.name] = job)
     return job
+end
+
+"""
+    restoreJobs!(store) -> Vector{Job}
+
+Give stored jobs without an action in this process their action back by
+resolving each job's `action_ref` with [`resolve_function`](@ref), so a
+scheduler runs jobs a previous process stored without adding them again. Jobs
+without an `action_ref` (anonymous functions) are skipped. Returns the
+restored jobs.
+
+This resolves functions by name through reflection, so it is unavailable in
+binaries compiled with `juliac --trim`; add every job with [`addJob!`](@ref)
+at startup there.
+"""
+function restoreJobs!(store::Store)
+    restored = Job[]
+    for stored in getJobs(store)
+        (stored.action === nothing && stored.action_ref !== nothing) || continue
+        f = resolve_function(stored.action_ref)
+        o = stored.options
+        options = o.timezone === nothing ? o : JobOptions(o.overlap_policy, o.retries, o.retry_delays,
+            o.retry_check, o.max_failed_executions, o.max_executions, o.expires_at, o.timezone,
+            zonecallback(o.timezone))
+        job = Job(f, stored.name, stored.schedule, stored.action_ref, stored.action_data, options)
+        job.disabledAt = stored.disabledAt
+        @lock store.lock (store.added[job.name] = job)
+        push!(restored, job)
+    end
+    return restored
 end
 
 """Remove a job and all execution history for that job."""
@@ -416,20 +679,8 @@ function purgeJob!(store::Store, job::Union{Job,AbstractString})
     name = job isa Job ? job.name : String(job)
     delete!(store.jobs, name)
     delete!(store.executions, name)
+    @lock store.lock delete!(store.added, name)
     return nothing
-end
-
-function disabled_copy(job::Job, at::DateTime)
-    return Job(
-        ReentrantLock(),
-        job.action,
-        job.action_ref,
-        job.action_data,
-        job.name,
-        job.schedule,
-        job.options,
-        at,
-    )
 end
 
 """
@@ -444,45 +695,48 @@ function disableJob!(
     at::DateTime=Dates.now(UTC),
 )
     name = job isa Job ? job.name : String(job)
-    updated = AbstractStores.modify!(store.jobs, name) do current
-        current === nothing ? nothing : disabled_copy(current, at)
-    end
+    # `@nospecialize`: backends that do not infer the view's type pass `Any`
+    updated = AbstractStores.modify!(store.jobs, name) do @nospecialize(current)
+        current === nothing ? nothing : disabled(current::JobRecord, at)
+    end::Union{Nothing, JobRecord}
     if job isa Job && updated !== nothing
         @lock job.lock job.disabledAt = at
     end
-    return updated
+    return updated === nothing ? nothing : Job(store, updated)
 end
+
+disabled(r::JobRecord, at::DateTime) = JobRecord(r.name, r.schedule, r.action_ref, r.action_data,
+    r.overlap_policy, r.retries, r.retry_delays, r.max_failed_executions, r.max_executions,
+    r.expires_at, r.timezone, at)
 
 """
     storeJobExecution!(store, execution)
 
-Prepend one execution to the job history and keep at most `history_limit`
-records. The update is atomic when the selected backend provides atomic
-`modify!`.
-
-A serializing backend encodes the whole `JobExecution`, including the value the
-job returned and any exception it threw, so those must be encodable by the
-backend's codec.
+Prepend one execution's [`JobExecutionRecord`](@ref) to the job history and keep
+at most `history_limit` records. The update is atomic when the selected backend
+provides atomic `modify!`.
 """
 function storeJobExecution!(store::Store, execution::JobExecution)
-    AbstractStores.modify!(store.executions, execution.job.name) do current
-        history = current === nothing ? JobExecution[] : copy(current)
-        pushfirst!(history, execution)
+    record = JobExecutionRecord(execution)
+    # `@nospecialize`: backends that do not infer the view's type pass `Any`
+    AbstractStores.modify!(store.executions, execution.job.name) do @nospecialize(current)
+        history = current === nothing ? JobExecutionRecord[] : copy(current::Vector{JobExecutionRecord})
+        pushfirst!(history, record)
         resize!(history, min(length(history), store.history_limit))
         return history
     end
     return execution
 end
 
-"""Return at most `n` execution records, newest first."""
+"""Return at most `n` [`JobExecutionRecord`](@ref)s, newest first."""
 function getNMostRecentJobExecutions(
     store::Store,
     job_name::String,
     n::Int,
 )
-    n <= 0 && return JobExecution[]
-    history = get(store.executions, job_name, nothing)
-    history === nothing && return JobExecution[]
+    n <= 0 && return JobExecutionRecord[]
+    history = _get(store.executions, job_name)
+    history === nothing && return JobExecutionRecord[]
     return history[1:min(n, length(history))]
 end
 
@@ -494,7 +748,7 @@ The main scheduling engine that executes jobs according to their schedules.
 # Fields:
 - `lock::ReentrantLock`: Ensures thread-safe access.
 - `jobExecutions::Vector{JobExecution}`: List of scheduled job executions.
-- `store::Store`: Job storage backend.
+- `store::S`: Job storage backend (a [`Store`](@ref)); the scheduler type is parameterized on it so store calls are statically dispatched.
 - `jobExecutionFinished::Threads.Event`: Signals all job executions have finished when shutting down.
 - `executingJobExecutions::Set{JobExecution}`: Tracks currently executing jobs.
 - `running::Bool`: Scheduler state (running/stopped).
@@ -503,10 +757,10 @@ The main scheduling engine that executes jobs according to their schedules.
 - `max_concurrent_executions::Int`: Limit on how many total executions can be running concurrently for this scheduler, defaults to `Threads.nthreads()`
 - `logging::Bool`: Whether to emit log messages during scheduler operations, defaults to `true`.
 """
-mutable struct Scheduler
+mutable struct Scheduler{S<:Store}
     const lock::ReentrantLock
     const jobExecutions::Vector{JobExecution}
-    const store::Store
+    const store::S
     const jobExecutionFinished::Threads.Event
     const executingJobExecutions::Set{JobExecution}
     running::Bool
@@ -515,19 +769,19 @@ mutable struct Scheduler
     const max_concurrent_executions::Int
     const logging::Bool
     Scheduler(
-        store::Store=InMemoryStore();
+        store::S=InMemoryStore();
         overlap_policy::Symbol=:skip,
         retries::Int = 3,
         retry_delays::Union{Base.ExponentialBackOff, Nothing}=retries == 0 ? nothing : Base.ExponentialBackOff(; n=retries),
-        retry_check=nothing,
+        retry_check::R=nothing,
         max_failed_executions::Union{Int, Nothing}=3,
         max_executions::Union{Int, Nothing}=nothing,
         expires_at::Union{DateTime, Nothing}=nothing,
         max_concurrent_executions::Int=Threads.nthreads(),
         logging::Bool=true,
-    ) = begin
+    ) where {S<:Store, R} = begin
         max_concurrent_executions >= 1 || throw(ArgumentError("max_concurrent_executions must be at least 1, got $max_concurrent_executions"))
-        new(ReentrantLock(), JobExecution[], store, Threads.Event(), Set{JobExecution}(), false, false, JobOptions(; overlap_policy, retries, retry_delays, retry_check, max_failed_executions, max_executions, expires_at), max_concurrent_executions, logging)
+        new{S}(ReentrantLock(), JobExecution[], store, Threads.Event(), Set{JobExecution}(), false, false, JobOptions(; overlap_policy, retries, retry_delays, retry_check, max_failed_executions, max_executions, expires_at), max_concurrent_executions, logging)
     end
 end
 
@@ -551,6 +805,9 @@ executions are queued or running (see [`runJobs!`](@ref)). Throws if the
 scheduler is already running or a previous timed-out close still has loop or
 job tasks in flight.
 
+Only stored jobs with an action in this process run (see [`addJob!`](@ref));
+others are skipped with a warning.
+
 A dispatch error stops the loop without canceling jobs that already started.
 Selected executions whose tasks were not started remain queued. Calling
 `run!` again rebuilds the queue from the stored jobs and their execution history.
@@ -569,6 +826,10 @@ function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
         # here must leave the scheduler stopped and safe to retry.
         initial_executions = JobExecution[]
         for job in getJobs(scheduler.store)
+            if job.action === nothing
+                scheduler.logging && @warn "Skipping stored job $(job.name): it has no action in this process. Add it with `Tempus.addJob!` or `push!` at startup, or call `Tempus.restoreJobs!`."
+                continue
+            end
             je = nextJobExecution(scheduler, job)
             je === nothing || push!(initial_executions, je)
         end
@@ -581,7 +842,7 @@ function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
         scheduler.loopActive = true
     end
     # start scheduler job execution task
-    errormonitor(Threads.@spawn :interactive try
+    Threads.@spawn :interactive try
         while true
             empty!(readyToExecute)
             now = trunc(Dates.now(UTC), Second)
@@ -679,6 +940,10 @@ function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
                 sleep(0.5)
             end
         end
+    catch e
+        # nothing waits on this task, so report the failure here
+        @error "Tempus scheduler loop failed" exception=(e, catch_backtrace())
+        rethrow()
     finally
         # the loop is the scheduler's liveness; however it exits — including a
         # store error thrown mid-iteration — the scheduler is no longer running
@@ -700,7 +965,7 @@ function run!(scheduler::Scheduler; close_when_no_jobs::Bool=false)
             scheduler.loopActive = false
             isempty(scheduler.executingJobExecutions) && notify(scheduler.jobExecutionFinished)
         end
-    end)
+    end
     return scheduler
 end
 
@@ -722,7 +987,8 @@ end
 
 Schedule `job`'s next execution, returning it, or `nothing` when no execution
 was scheduled: the job is done (see [`nextJobExecution`](@ref)), it has been
-removed from the store, an execution at the same time is already queued, or —
+removed from the store, it has no action in this process, an execution at the
+same time is already queued, or —
 for one-shot jobs, which are rescheduled only when an attempt fails — an
 execution is already queued or running. `scheduler.lock` must be held.
 
@@ -731,6 +997,7 @@ The new execution is appended without re-sorting (so callers iterating
 restore scheduledStart order before the scheduler loop scans the list again.
 """
 function scheduleNextExecution!(scheduler::Scheduler, job::Job)
+    job.action === nothing && return nothing
     # a job removed from the store (e.g. via `purgeJob!`) must not be revived
     haskey(scheduler.store.jobs, job.name) || return nothing
     next = nextJobExecution(scheduler, job)
@@ -748,7 +1015,7 @@ function scheduleNextExecution!(scheduler::Scheduler, job::Job)
 end
 
 function executeJob!(scheduler::Scheduler, jobExecution::JobExecution)
-    errormonitor(Threads.@spawn begin
+    Threads.@spawn try
         now = Dates.now(UTC)
         if scheduler.logging
             if jobExecution.runConcurrently
@@ -758,27 +1025,27 @@ function executeJob!(scheduler::Scheduler, jobExecution::JobExecution)
             end
         end
         retry_check = _some(jobExecution.job.options.retry_check, scheduler.jobOptions.retry_check)
-        check = (eb, e) -> begin
+        check = (eb, @nospecialize(e)) -> begin
             if isdisabled(jobExecution.job)
                 scheduler.logging && @info "[$(jobExecution.jobExecutionId)]: Skipping job $(jobExecution.job.name) retry due to job being disabled"
                 return false
             end
-            should_retry = retry_check !== nothing ? retry_check(eb, e) : true
+            should_retry = retry_check === nothing || retry_check(RetryCheckCall(eb, e)).retry
             if should_retry
                 scheduler.logging && @info "[$(jobExecution.jobExecutionId)]: Job $(jobExecution.job.name) execution failed, retrying"
             end
             return should_retry
         end
-        data = jobExecution.job.action_data
-        base_action = data !== nothing ?
-            () -> jobExecution.job.action(; JSON.parse(data)...) :
-            jobExecution.job.action
-        f = _some(jobExecution.job.options.retry_delays, scheduler.jobOptions.retry_delays) !== nothing ?
-            Base.retry(base_action; delays=_some(jobExecution.job.options.retry_delays, scheduler.jobOptions.retry_delays), check=check) :
+        # only jobs with an action are scheduled (see scheduleNextExecution!)
+        action = jobExecution.job.action::JobAction
+        base_action = () -> action()
+        retry_delays = _some(jobExecution.job.options.retry_delays, scheduler.jobOptions.retry_delays)
+        f = retry_delays !== nothing ?
+            Base.retry(base_action; delays=retry_delays, check=check) :
             base_action
         jobExecution.actualStart = now
         try
-            jobExecution.result = Base.invokelatest(f)
+            jobExecution.result = f()
             jobExecution.status = :succeeded
             jobExecution.exception = nothing
         catch e
@@ -796,15 +1063,15 @@ function executeJob!(scheduler::Scheduler, jobExecution::JobExecution)
         @lock scheduler.lock begin
             delete!(scheduler.executingJobExecutions, jobExecution)
             try
-                current_job = get(scheduler.store.jobs, jobExecution.job.name, nothing)
+                record = _get(scheduler.store.jobs, jobExecution.job.name)
+                current_job = record === nothing ? nothing : Job(scheduler.store, record)
                 if current_job === nothing
                     # The job was removed while this execution was running. Do
                     # not recreate its history or leave stale queued executions.
                     filter!(je -> je.job.name != jobExecution.job.name, scheduler.jobExecutions)
                 else
-                    # A persisting store serializes the execution, including
-                    # whatever the job returned or threw. An unencodable value
-                    # must not take the scheduler's bookkeeping down with it.
+                    # A store failure must not take the scheduler's
+                    # bookkeeping down with it.
                     try
                         storeJobExecution!(scheduler.store, jobExecution)
                     catch e
@@ -835,7 +1102,11 @@ function executeJob!(scheduler::Scheduler, jobExecution::JobExecution)
             !scheduler.running && !scheduler.loopActive &&
                 isempty(scheduler.executingJobExecutions) && notify(scheduler.jobExecutionFinished)
         end
-    end)
+    catch e
+        # nothing waits on this task, so report the failure here
+        @error "Tempus job execution task failed" exception=(e, catch_backtrace())
+        rethrow()
+    end
     return
 end
 
@@ -845,33 +1116,38 @@ end
 Closes the scheduler, stopping job execution; waits up to `timeout` seconds
 (5 by default) for any currently executing jobs to finish before returning.
 """
-function Base.close(scheduler::Scheduler; timeout::Real=5)
+function Base.close(@nospecialize(scheduler::Scheduler); timeout::Real=5)
+    # Unspecialized, so one compiled method closes a scheduler of any store type, even one
+    # held in an abstractly typed field. It reads and writes fields with the `getfield` and
+    # `setfield!` builtins and captures the scheduler in no closure, so every call stays static.
     isfinite(timeout) && timeout >= 0 ||
         throw(ArgumentError("timeout must be a finite non-negative number, got $timeout"))
-    scheduler.logging && @info "Closing scheduler and waiting $(timeout)s for job executions to stop."
-    @lock scheduler.lock begin
-        scheduler.running = false
-        if !scheduler.loopActive && isempty(scheduler.executingJobExecutions)
-            notify(scheduler.jobExecutionFinished)
-        end
+    lk = getfield(scheduler, :lock)
+    logging = getfield(scheduler, :logging)
+    logging && @info "Closing scheduler and waiting $(timeout)s for job executions to stop."
+    @lock lk begin
+        setfield!(scheduler, :running, false)
+        _stopped(scheduler) && notify(getfield(scheduler, :jobExecutionFinished))
     end
 
     # Do not notify jobExecutionFinished on timeout. That event means the loop
     # and every execution are actually finished; using it as a timeout signal
     # makes wait(scheduler) lie and permits an unsafe restart of active work.
-    status = Base.timedwait(
-        () -> (@lock scheduler.lock begin
-            !scheduler.loopActive && isempty(scheduler.executingJobExecutions)
-        end),
-        timeout,
-    )
-    if status == :timed_out
-        scheduler.logging && @warn "Scheduler closing timeout reached, returning without waiting for job executions to finish."
-    else
-        scheduler.logging && @info "Scheduler closed and job execution stopped."
+    deadline = time() + timeout
+    while !(@lock lk _stopped(scheduler))
+        if time() >= deadline
+            logging && @warn "Scheduler closing timeout reached, returning without waiting for job executions to finish."
+            return
+        end
+        sleep(0.1)
     end
+    logging && @info "Scheduler closed and job execution stopped."
     return
 end
+
+# Whether the dispatch loop and every job execution have stopped. Hold the lock.
+_stopped(@nospecialize(scheduler::Scheduler)) =
+    !getfield(scheduler, :loopActive) && isempty(getfield(scheduler, :executingJobExecutions))
 
 """
     wait(scheduler::Scheduler)
@@ -882,7 +1158,7 @@ loop automatically when no executions are queued or running.
 
 Returning does not mean every queued job ran: closing the scheduler or a
 dispatch error can leave unstarted executions queued. Background task errors
-are reported by the task error monitor; `wait(scheduler)` does not rethrow them.
+are logged with `@error`; `wait(scheduler)` does not rethrow them.
 """
 Base.wait(scheduler::Scheduler) = wait(scheduler.jobExecutionFinished)
 

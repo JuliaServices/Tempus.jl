@@ -22,12 +22,6 @@ struct Wildcard <: CronField end
 
 Base.show(io::IO, ::Wildcard) = print(io, "*")
 
-## Determines if a period `p` is allowed based on cron field definitions
-allowed(::Period, ::Wildcard, ::Period, ::Wildcard) = true
-allowed(p::Period, x::CronField, ::Period, ::Wildcard) = allowed(p, x)
-allowed(::Period, ::Wildcard, q::Period, y::CronField) = allowed(q, y)
-allowed(p::Period, x::CronField, q::Period, y::CronField) = allowed(p, x) || allowed(q, y)
-
 allowed(p::P, ::Wildcard) where {P <: Period} = p in allowedrange(P)
 valid(::Type{P}, ::Wildcard) where {P <: Period} = true
 
@@ -104,35 +98,55 @@ end
 minimumallowed(::Type{P}, x::Step) where {P <: Period} = minimumallowed(P, x.range)
 valid(::Type{P}, x::Step) where {P <: Period} = x.step >= 1 && valid(P, x.range) && P(x.step) in allowedrange(P)
 
-## Represents a parsed cron expression with individual fields for each unit of time
-struct Cron{S, M, H, D, Mo, DoW}
-    second::S
-    minute::M
-    hour::H
-    day_of_month::D
-    month::Mo
-    day_of_week::DoW
+const CronFieldValue = Union{Wildcard, Numeric, Range, List, Step}
+
+# Call `f(p, x)` on a parsed field. Inference splits unions of at most four
+# types, so calls on a five-type field value are branched explicitly to keep
+# them statically dispatched (trimmed binaries cannot dispatch dynamically).
+@inline function cronsplit(f::F, p::P, @nospecialize(x::CronFieldValue)) where {F, P}
+    x isa Wildcard && return f(p, x)
+    x isa Numeric && return f(p, x)
+    x isa Range && return f(p, x)
+    x isa List && return f(p, x)
+    return f(p, x::Step)
 end
 
-function Base.show(io::IO, c::Cron)
-    print(io, "\"")
-    show(io, c.second)
-    print(io, " ")
-    show(io, c.minute)
-    print(io, " ")
-    show(io, c.hour)
-    print(io, " ")
-    show(io, c.day_of_month)
-    print(io, " ")
-    show(io, c.month)
-    print(io, " ")
-    show(io, c.day_of_week)
-    print(io, "\"")
+## Represents a parsed cron expression with individual fields for each unit of time
+struct Cron
+    second::CronFieldValue
+    minute::CronFieldValue
+    hour::CronFieldValue
+    day_of_month::CronFieldValue
+    month::CronFieldValue
+    day_of_week::CronFieldValue
+    Cron(@nospecialize(second::CronFieldValue), @nospecialize(minute::CronFieldValue),
+         @nospecialize(hour::CronFieldValue), @nospecialize(day_of_month::CronFieldValue),
+         @nospecialize(month::CronFieldValue), @nospecialize(day_of_week::CronFieldValue)) =
+        new(second, minute, hour, day_of_month, month, day_of_week)
 end
+
+# the six fields as a cron expression, seconds first
+function printcron(io::IO, c::Cron)
+    for x in (c.second, c.minute, c.hour, c.day_of_month, c.month)
+        cronsplit(show, io, x)
+        print(io, ' ')
+    end
+    cronsplit(show, io, c.day_of_week)
+    return
+end
+
+cronstring(c::Cron) = sprint(printcron, c)
+
+Base.show(io::IO, c::Cron) = (print(io, '"'); printcron(io, c); print(io, '"'))
+
+# equal when they print as the same expression (`List` holds a vector, so the
+# default `===` comparison would only match the same parsed object)
+Base.:(==)(a::Cron, b::Cron) = cronstring(a) == cronstring(b)
+Base.hash(c::Cron, h::UInt) = hash(cronstring(c), h)
 
 # parse an individual cron expression field
 # looking for wildcard, numeric value, list, range, or step
-function parseCronField(field)
+function parseCronField(field)::CronFieldValue
     # wildcard
     if field == "*"
         return Wildcard()
@@ -156,7 +170,8 @@ function parseCronField(field)
     # step
     if occursin(r"^(?:\*|\d+-\d+)(?:/\d+)$", field)
         parts = split(field, "/")
-        return Step(parseCronField(parts[1]), parse(Int, parts[2]))
+        range = parts[1] == "*" ? Wildcard() : parseCronField(parts[1])::Range
+        return Step(range, parse(Int, parts[2]))
     end
     # list
     if occursin(r"^\d+(,\d+)+$", field)
@@ -218,45 +233,43 @@ function parseCron(cron::AbstractString)
         expr === nothing && throw(ArgumentError("Unknown cron alias: $cron"))
     end
     parts = split(expr)
-    if length(parts) == 5
-        minute, hour, day = map(parseCronField, parts[1:3])
-        month = parseCronField(substitutenames(parts[4], MONTH_NAMES))
-        day_of_week = parseCronField(substitutenames(parts[5], DAY_NAMES))
-        second = Numeric(0)
-    elseif length(parts) == 6
-        second, minute, hour, day = map(parseCronField, parts[1:4])
-        month = parseCronField(substitutenames(parts[5], MONTH_NAMES))
-        day_of_week = parseCronField(substitutenames(parts[6], DAY_NAMES))
-    else
-        throw(ArgumentError("Invalid cron expression: $cron"))
-    end
-    day_of_week = normalizedow(day_of_week)
+    length(parts) in (5, 6) || throw(ArgumentError("Invalid cron expression: $cron"))
+    # a five-field expression has no seconds field and fires at second 0
+    i = length(parts) - 5
+    second = i == 0 ? Numeric(0) : parseCronField(parts[1])
+    minute = parseCronField(parts[i + 1])
+    hour = parseCronField(parts[i + 2])
+    day = parseCronField(parts[i + 3])
+    month = parseCronField(substitutenames(parts[i + 4], MONTH_NAMES))
+    day_of_week = cronsplit((_, x) -> normalizedow(x), nothing,
+                            parseCronField(substitutenames(parts[i + 5], DAY_NAMES)))
     # validate cron fields (seconds in range 0-59, minutes in range 0-59, hours in range 0-23, day of month in range 1-31, month in range 1-12, day of week in range 0-6)
-    if !valid(Second, second)
-        throw(ArgumentError("Invalid seconds value: $second"))
-    end
-    if !valid(Minute, minute)
-        throw(ArgumentError("Invalid minutes value: $minute"))
-    end
-    if !valid(Hour, hour)
-        throw(ArgumentError("Invalid hours value: $hour"))
-    end
-    if !valid(DayOfWeek, day_of_week)
-        throw(ArgumentError("Invalid day of week value: $day_of_week"))
-    end
-    if !valid(Day, day)
-        throw(ArgumentError("Invalid day of month value: $day"))
-    end
-    if !valid(Month, month)
-        throw(ArgumentError("Invalid month value: $month"))
-    end
+    checkfield(Second, second, "seconds")
+    checkfield(Minute, minute, "minutes")
+    checkfield(Hour, hour, "hours")
+    checkfield(DayOfWeek, day_of_week, "day of week")
+    checkfield(Day, day, "day of month")
+    checkfield(Month, month, "month")
     # "0 0 30 2 *" never fires. Reject it here: once stored, a job with such a
     # schedule makes push! and every later run! on that store throw.
-    if day_of_week isa Wildcard && !any(allowed(Day(d), day) && allowed(Month(m), month)
-                                        for m in 1:12 for d in 1:daysinmonth(2024, m))  # 2024 has Feb 29
+    day_of_week isa Wildcard && !anydayofmonth(day, month) &&
         throw(ArgumentError("Invalid cron expression, no allowed month has that day of month: $cron"))
-    end
     return Cron(second, minute, hour, day, month, day_of_week)
+end
+
+function checkfield(::Type{P}, @nospecialize(x::CronFieldValue), name::String) where {P}
+    cronsplit(valid, P, x) && return
+    io = IOBuffer()
+    cronsplit(show, io, x)
+    throw(ArgumentError(string("Invalid ", name, " value: ", String(take!(io)))))
+end
+
+# Whether some allowed month has an allowed day of month, counting Feb 29.
+function anydayofmonth(@nospecialize(day::CronFieldValue), @nospecialize(month::CronFieldValue))
+    for m in 1:12, d in 1:daysinmonth(2024, m)  # 2024 has Feb 29
+        cronsplit(allowed, Day(d), day) && cronsplit(allowed, Month(m), month) && return true
+    end
+    return false
 end
 
 const ANY_CRON = Cron(Wildcard(), Wildcard(), Wildcard(), Wildcard(), Wildcard(), Wildcard())
@@ -279,8 +292,8 @@ const MAX_LOOKAHEAD = Dates.Year(10)
 # day-of-week, and month lengths interact; the month check above fast-forwards
 # over months that can't match.
 function getnext(cron::Cron, from::DateTime=Dates.now(UTC))
-    minSeconds = minimumallowed(Second, cron.second)
-    minMinutes = minimumallowed(Minute, cron.minute)
+    minSeconds = cronsplit(minimumallowed, Second, cron.second)
+    minMinutes = cronsplit(minimumallowed, Minute, cron.minute)
     limit = from + MAX_LOOKAHEAD
     next = trunc(from, Second) + Second(1)
     while true
@@ -292,8 +305,8 @@ function getnext(cron::Cron, from::DateTime=Dates.now(UTC))
         ))
         # check month
         curMonth = Month(next)
-        if !allowed(curMonth, cron.month)
-            nextMonth = nextallowed(curMonth, cron.month)
+        if !cronsplit(allowed, curMonth, cron.month)
+            nextMonth = cronsplit(nextallowed, curMonth, cron.month)
             # a next allowed month at or before the current one means we wrapped
             # into the next year; either way restart at the first day of that
             # month and let the checks below advance day/hour/minute/second
@@ -306,14 +319,14 @@ function getnext(cron::Cron, from::DateTime=Dates.now(UTC))
         curDay = Day(next)
         # cron numbers days 0=Sunday..6=Saturday; Dates.dayofweek gives 1=Monday..7=Sunday
         curDayOfWeek = DayOfWeek(dayofweek(next) % 7)
-        if !allowed(curDay, cron.day_of_month, curDayOfWeek, cron.day_of_week)
+        if !allowedday(cron, curDay, curDayOfWeek)
             next = DateTime(Date(next) + Dates.Day(1))
             continue
         end
         # check hour
         curHour = Hour(next)
-        if !allowed(curHour, cron.hour)
-            nextHour = nextallowed(curHour, cron.hour)
+        if !cronsplit(allowed, curHour, cron.hour)
+            nextHour = cronsplit(nextallowed, curHour, cron.hour)
             if nextHour <= curHour
                 # wraps into the next day, which must be revalidated against the
                 # date fields above
@@ -325,8 +338,8 @@ function getnext(cron::Cron, from::DateTime=Dates.now(UTC))
         end
         # check minute
         curMinute = Minute(next)
-        if !allowed(curMinute, cron.minute)
-            nextMinute = nextallowed(curMinute, cron.minute)
+        if !cronsplit(allowed, curMinute, cron.minute)
+            nextMinute = cronsplit(nextallowed, curMinute, cron.minute)
             if nextMinute <= curMinute
                 next = trunc(next, Hour) + Hour(1)
             else
@@ -336,8 +349,8 @@ function getnext(cron::Cron, from::DateTime=Dates.now(UTC))
         end
         # check second
         curSecond = Second(next)
-        if !allowed(curSecond, cron.second)
-            nextSecond = nextallowed(curSecond, cron.second)
+        if !cronsplit(allowed, curSecond, cron.second)
+            nextSecond = cronsplit(nextallowed, curSecond, cron.second)
             if nextSecond <= curSecond
                 next = trunc(next, Minute) + Minute(1)
             else
@@ -348,6 +361,14 @@ function getnext(cron::Cron, from::DateTime=Dates.now(UTC))
         # all fields are now valid/allowed, return
         return next
     end
+end
+
+# When both day-of-month and day-of-week are restricted, a day matching either
+# one is allowed (standard cron semantics); a `*` field defers to the other.
+function allowedday(cron::Cron, day::Day, dow::DayOfWeek)
+    cron.day_of_month isa Wildcard && return cronsplit(allowed, dow, cron.day_of_week)
+    cron.day_of_week isa Wildcard && return cronsplit(allowed, day, cron.day_of_month)
+    return cronsplit(allowed, day, cron.day_of_month) || cronsplit(allowed, dow, cron.day_of_week)
 end
 
 """

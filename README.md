@@ -71,13 +71,11 @@ Tempus.unschedule!(scheduler, job)
 
 ### Choosing a State Backend
 
-Tempus stores jobs and bounded execution history as two namespaced views over
-one AbstractStores backend. The backend must accept heterogeneous values — an
-`AbstractStore{Any}` — and hand them back with their types intact, which means
-either `MemoryStore` or a store using the default `SerializedCodec`. A
-`JSONCodec` backend decodes at its own `eltype` and would return
-`Dict{String,Any}` where Tempus expects a `Job`. The default scheduler uses
-process memory:
+Tempus stores job records and bounded execution history as two namespaced
+views over one AbstractStores backend. The backend must accept heterogeneous
+values, i.e. be an `AbstractStore{Any}`; any codec works, including
+`FileStore(dir; codec=JSONCodec())` (needs `using JSON`). The default scheduler
+uses process memory:
 
 ```julia
 using AbstractStores, Tempus
@@ -112,17 +110,38 @@ not read or migrated — a scheduler started against an old `jobs.dat` starts
 empty. Execution history is now persisted too, which Tempus 2's file store did
 not do.
 
-Jobs are persisted with their action function, so use named functions from a
-module that is loaded before reopening a persistent store: an action the process
-cannot resolve fails the whole load. Anonymous functions and Julia's native
-serialized representation are not stable across Julia sessions or Julia
-versions.
+A store persists each job's definition (name, schedule, options, disabled
+state) and execution history, but not its action: the action lives in the
+`Tempus.Store` object the job was added to with `Tempus.addJob!` (or
+`push!(scheduler, job)`). Add every job at startup; any function works,
+including closures over application state. A scheduler skips stored jobs that
+have no action in this process. To run jobs a previous process stored without
+adding them again, call `Tempus.restoreJobs!(store)`, which resolves each named
+function by its module path.
 
 Treat a persistent store's contents as trusted input: the default backends use
 Julia's `Serialization`, and deserializing attacker-controlled data can execute
 arbitrary code — whoever can write to the store's directory, database, or Redis
 keyspace can run code in any process that reopens it. Protect the backing
 storage with filesystem or database permissions accordingly.
+
+### Compiling with `juliac --trim`
+
+The scheduler and cron parsing compile into trimmed binaries
+(`juliac --trim=safe`) with a `MemoryStore` backend on Julia 1.13 and later, and
+with a `JSONCodec` store on Julia 1.14 and later (Julia 1.13's trim verifier
+rejects JSON.jl's typed decoding of nested structs). Other backends, such as
+the default `SerializedCodec`, are not trim-safe. In a trimmed binary:
+
+- create jobs at run time and add them at every startup; `restoreJobs!` and
+  `resolve_function` use reflection and are unavailable;
+- pass job parameters by capturing them in the action instead of `job_params`,
+  which are converted to keyword arguments from JSON at every call;
+- declare a `retry_check`'s exception argument `@nospecialize`:
+  `retry_check=(state, @nospecialize(e)) -> e isa MyError`.
+
+Timezone-aware schedules load TimeZones' database, which is not trim-safe;
+that code is only compiled into programs that create jobs with a `timezone`.
 
 ## Cron Syntax
 Tempus.jl uses standard cron syntax, with an optional leading seconds field:

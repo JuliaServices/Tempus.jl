@@ -22,8 +22,13 @@ const FS_RAN = Channel{Nothing}(1000)
 _filestore_test_action() = put!(FS_RAN, nothing)
 _sqlite_test_action() = nothing
 
-struct FailingHistoryStore <: AbstractStores.AbstractStore{Vector{Tempus.JobExecution}} end
+struct FailingHistoryStore <: AbstractStores.AbstractStore{Vector{Tempus.JobExecutionRecord}} end
 Base.get(::FailingHistoryStore, ::AbstractString, default) = error("history unavailable")
+
+# reads succeed (empty history); every history write fails
+struct UnwritableHistoryStore <: AbstractStores.AbstractStore{Vector{Tempus.JobExecutionRecord}} end
+Base.get(::UnwritableHistoryStore, ::AbstractString, default) = default
+AbstractStores.modify!(f, ::UnwritableHistoryStore, ::AbstractString; kw...) = error("history write failed")
 
 @testset "parseCronField Tests" begin
     # Wildcard: should parse "*" into a Wildcard type.
@@ -424,6 +429,9 @@ end
         @test !isempty(
             Tempus.getNMostRecentJobExecutions(fs, "testjob_fs", 10),
         )
+        # a reopened store has no actions until jobs are added or restored
+        @test only(Tempus.getJobs(fs)).action === nothing
+        @test only(Tempus.restoreJobs!(fs)).name == "testjob_fs"
         withscheduler(fs) do sch
             take_within!(FS_RAN)
         end
@@ -453,6 +461,7 @@ end
     history = Tempus.getNMostRecentJobExecutions(store, job.name, 10)
     @test length(history) == 2
     @test history[1].scheduledStart == DateTime(2024, 1, 1, 0, 0, 3)
+    @test history[1].succeeded
 
     disabled_at = DateTime(2024, 1, 2)
     Tempus.disableJob!(store, job; at=disabled_at)
@@ -510,7 +519,8 @@ end
         store = Tempus.FileStore(raw"$state")
         jobs = Tempus.getJobs(store)
         length(jobs) == 1 || error("expected 1 job, got \$(length(jobs))")
-        job = only(jobs)
+        only(jobs).action === nothing || error("action was persisted")
+        job = only(Tempus.restoreJobs!(store))
         job.name == "fresh_process_job" || error("wrong job name: \$(job.name)")
         job.schedule === nothing && error("schedule did not survive persistence")
         job.action()
@@ -520,32 +530,23 @@ end
     end
 end
 
-@testset "Unstorable execution does not wedge the scheduler" begin
-    mktempdir() do dir
-        ran = Channel{Nothing}(100)
-        task_release = Channel{Nothing}(100)
-        job = Tempus.Job("unstorable_result", "* * * * * *") do
-            put!(ran, nothing)
-            # a *running* Task cannot be serialized, so persisting this
-            # execution throws inside the execution task
-            return Threads.@spawn (take!(task_release); nothing)
-        end
-        scheduler = Tempus.Scheduler(Tempus.FileStore(dir); logging=false)
-        try
-            Tempus.run!(scheduler)
-            push!(scheduler, job)
-            take_within!(ran)
-            take_within!(ran)   # still scheduling after the storage failure
-            # bookkeeping intact: the failed store must not strand the execution
-            @test waitfor(() -> (@lock scheduler.lock isempty(scheduler.executingJobExecutions)))
-        finally
-            # stop the loop without waiting: if this regression ever comes back,
-            # `close` blocks on executions that never finished bookkeeping, and a
-            # hung test is worse than a failed one
-            @lock scheduler.lock (scheduler.running = false)
-            # let the unstorable tasks the executions returned finish
-            foreach(_ -> put!(task_release, nothing), 1:10)
-        end
+@testset "Failed history write does not wedge the scheduler" begin
+    ran = Channel{Nothing}(100)
+    job = Tempus.Job(() -> put!(ran, nothing), "unstorable_history", "* * * * * *")
+    store = Tempus.Store(MemoryStore{Tempus.JobRecord}(), UnwritableHistoryStore())
+    scheduler = Tempus.Scheduler(store; logging=false)
+    try
+        Tempus.run!(scheduler)
+        push!(scheduler, job)
+        take_within!(ran)
+        take_within!(ran)   # still scheduling after the storage failure
+        # bookkeeping intact: the failed store must not strand the execution
+        @test waitfor(() -> (@lock scheduler.lock isempty(scheduler.executingJobExecutions)))
+    finally
+        # stop the loop without waiting: if this regression ever comes back,
+        # `close` blocks on executions that never finished bookkeeping, and a
+        # hung test is worse than a failed one
+        @lock scheduler.lock (scheduler.running = false)
     end
 end
 
@@ -754,7 +755,57 @@ end
     @test job.action_data !== nothing
     parsed = JSON.parse(job.action_data)
     @test parsed["msg"] == "hello"
-    @test job.action(; parsed...) == "hello"
+    @test job.action() == "hello"   # params are passed as keyword arguments
+end
+
+@testset "JSON-encoded store" begin
+    mktempdir() do dir
+        backend = AbstractStores.FileStore(dir; codec=AbstractStores.JSONCodec())
+        # an application adds its jobs, closures over its state, at every start
+        ran = Channel{Nothing}(100)
+        hourly_runs = Ref(0)
+        for start in 1:2
+            app = Tempus.Store(backend; prefix="app/")
+            Tempus.addJob!(app, Tempus.Job(() -> put!(ran, nothing), "tick", "* * * * * *"))
+            Tempus.addJob!(app, Tempus.Job(() -> (hourly_runs[] += 1), "hourly", "0 0 * * * *";
+                overlap_policy=:skip, retries=0))
+            withscheduler(app; logging=false) do sch
+                take_within!(ran)
+            end
+        end
+        app = Tempus.Store(backend; prefix="app/")
+        @test Set(job.name for job in Tempus.getJobs(app)) == Set(["tick", "hourly"])
+        @test all(job -> job.action === nothing && job.action_ref === nothing, Tempus.getJobs(app))
+        @test length(Tempus.getNMostRecentJobExecutions(app, "tick", 10)) >= 2
+        @test isempty(Tempus.restoreJobs!(app))   # closures cannot be resolved by name
+
+        store = Tempus.Store(backend)
+        Tempus.runJobs!(store, [Tempus.OneShotJob(() -> nothing, "json_once")]; logging=false)
+        job = Tempus.Job(_filestore_test_action, "json_job", "0,30 9-17 * * MON-FRI";
+            overlap_policy=:queue, retries=2, timezone="America/Denver")
+        Tempus.addJob!(store, job)
+
+        # a fresh `Store` reads the records back but has no actions
+        reopened = Tempus.Store(backend)
+        stored = only(filter(j -> j.name == "json_job", Tempus.getJobs(reopened)))
+        @test stored.action === nothing
+        @test stored.schedule == job.schedule
+        @test stored.options.overlap_policy === :queue
+        @test stored.options.retries == 2
+        @test stored.options.timezone == "America/Denver"
+        @test only(Tempus.getNMostRecentJobExecutions(reopened, "json_once", 10)).succeeded
+        @test_throws ArgumentError Tempus.nextJobExecution(reopened, stored; logging=false)
+
+        restored = only(filter(j -> j.name == "json_job", Tempus.restoreJobs!(reopened)))
+        @test Tempus.nextJobExecution(reopened, restored; logging=false) isa Tempus.JobExecution
+    end
+end
+
+@testset "Callbacks built during precompilation fail clearly" begin
+    job = Tempus.Job(() -> 1, "precompiled", "* * * * *")
+    @test job.action() == 1
+    job.action.ptr = C_NULL   # what a package image stores for a precompiled callback
+    @test_throws ArgumentError job.action()
 end
 
 @testset "getnext rollover regressions" begin
@@ -774,6 +825,9 @@ end
     # (parseCron rejects it, so build it directly)
     feb30 = Tempus.Cron(Tempus.Numeric(0), Tempus.Numeric(0), Tempus.Numeric(0), Tempus.Numeric(30), Tempus.Numeric(2), Tempus.Wildcard())
     @test_throws ArgumentError getnext(feb30, DateTime(2021, 1, 1))
+    # separately parsed schedules compare equal, including list fields
+    @test parseCron("0,30 * * * *") == parseCron("0,30 * * * *")
+    @test parseCron("0,30 * * * *") != parseCron("0,15 * * * *")
 end
 
 @testset "Step field semantics" begin
@@ -871,7 +925,7 @@ end
 end
 
 @testset "run! initialization failure leaves scheduler stopped" begin
-    jobs = MemoryStore{Tempus.Job}()
+    jobs = MemoryStore{Tempus.JobRecord}()
     store = Tempus.Store(jobs, FailingHistoryStore())
     Tempus.addJob!(store, Tempus.OneShotJob(() -> nothing, "init_failure"))
     scheduler = Tempus.Scheduler(store; logging=false)
@@ -1003,8 +1057,7 @@ end
     Tempus.runJobs!(store, [job]; retries=0, max_failed_executions=1, logging=false)
     history = Tempus.getNMostRecentJobExecutions(store, "showable_failure", 5)
     @test !isempty(history)
-    @test history[1].status == :failed
-    @test history[1].result === nothing  # was left #undef, so show() threw UndefRefError
+    @test !history[1].succeeded
     @test sprint(show, history[1]) isa String
 end
 
