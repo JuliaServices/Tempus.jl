@@ -1,6 +1,9 @@
 using Test
 
-const _TRIM_SUPPORTED = VERSION >= v"1.12.0-rc1"
+# In a binary trimmed with Julia 1.12, the scheduler's dispatch-loop task never
+# runs, so scheduled jobs never fire. The README supports trimming on Julia
+# 1.13 and later.
+const _TRIM_SUPPORTED = VERSION >= v"1.13.0-"
 const _TRIM_PRE_RELEASE = !isempty(VERSION.prerelease)
 const _TRIM_SETUP_TIMEOUT_S = Sys.iswindows() ? 600.0 : 180.0
 const _TRIM_COMPILE_TIMEOUT_S = Sys.iswindows() ? 600.0 : 300.0
@@ -136,7 +139,7 @@ end
         )
         @test true
     elseif !_TRIM_SUPPORTED
-        println("[trim] skip Julia < 1.12")
+        println("[trim] skip Julia < 1.13")
         @test true
     elseif _TRIM_PRE_RELEASE
         println("[trim] skip prerelease Julia")
