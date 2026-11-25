@@ -1121,6 +1121,32 @@ end
     close(scheduler; timeout=3)
 end
 
+@testset "Disabling stops jobs queued before run!" begin
+    # run! used to queue copies of the stored jobs, so neither `disable!(job)`
+    # nor `disableJob!(store, name)` stopped a job pushed before run! (the
+    # README's order)
+    store = Tempus.InMemoryStore()
+    ran = Channel{String}(100)
+    by_object = Tempus.Job(() -> put!(ran, "by_object"), "disabled_by_object", "* * * * * *")
+    by_name = Tempus.Job(() -> put!(ran, "by_name"), "disabled_by_name", "* * * * * *")
+    scheduler = Tempus.Scheduler(store; logging=false)
+    push!(scheduler, by_object)
+    push!(scheduler, by_name)
+    try
+        # holding the lock keeps the dispatch loop from starting until both are disabled
+        @lock scheduler.lock begin
+            Tempus.run!(scheduler; close_when_no_jobs=true)
+            Tempus.disable!(by_object)
+            Tempus.disableJob!(store, "disabled_by_name")
+        end
+        # their queued executions come due, are dropped, and the loop stops
+        @test waitfor(() -> @lock(scheduler.lock, !scheduler.loopActive), 10)
+        @test !isready(ran)
+    finally
+        close(scheduler; timeout=2)
+    end
+end
+
 @testset "Options validation" begin
     @test_throws ArgumentError Tempus.Job(() -> nothing, "v1", "* * * * *"; overlap_policy=:sometimes)
     @test_throws ArgumentError Tempus.Job(() -> nothing, "v2", "* * * * *"; timezone="America/Nowhere")
