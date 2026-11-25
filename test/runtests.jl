@@ -1122,8 +1122,8 @@ end
 end
 
 @testset "Job-level retries=0 overrides the scheduler's retries" begin
-    # an explicit `retries=0` used to be indistinguishable from leaving it
-    # unset, so the scheduler's retries still re-ran the failing action
+    # A job's explicit `retries=0` overrides the scheduler's retries; a job that
+    # leaves `retries` unset uses them
     for (options, attempts_expected) in (((; retries=0), 1), ((;), 3))
         attempts = Ref(0)
         job = Tempus.OneShotJob(() -> (attempts[] += 1; error("boom")), "retries_override";
