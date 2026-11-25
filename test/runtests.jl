@@ -1122,9 +1122,8 @@ end
 end
 
 @testset "Disabling stops jobs queued before run!" begin
-    # run! used to queue copies of the stored jobs, so neither `disable!(job)`
-    # nor `disableJob!(store, name)` stopped a job pushed before run! (the
-    # README's order)
+    # A job pushed before run! (the README's order) stops once disabled, by object
+    # (`disable!(job)`) or by name (`disableJob!(store, name)`)
     store = Tempus.InMemoryStore()
     ran = Channel{String}(100)
     by_object = Tempus.Job(() -> put!(ran, "by_object"), "disabled_by_object", "* * * * * *")
