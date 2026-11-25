@@ -600,13 +600,20 @@ function SQLiteStore(connection; table::AbstractString="tempus_state", kw...)
     return Store(backend; kw...)
 end
 
-# The job a stored record describes: the job added under its name in this
-# process, with the record's disabled state, or else a job rebuilt from the
-# record without an action.
+# The job a stored record describes: the job object added under its name in
+# this process, or else a job rebuilt from the record without an action.
+# Returning the added object itself keeps one disabled flag per job, so
+# `disable!(job)` stops the job wherever a scheduler queued it. A disabled
+# record (`disableJob!`, an execution cap, or another process sharing the
+# backend) disables the added job too.
 function Job(store::Store, record::JobRecord)
     added = @lock store.lock get(store.added, record.name, nothing)
-    added === nothing || return Job(ReentrantLock(), added.action, added.action_ref,
-        added.action_data, added.name, added.schedule, added.options, record.disabledAt)
+    if added !== nothing
+        if record.disabledAt !== nothing
+            @lock added.lock (added.disabledAt === nothing && (added.disabledAt = record.disabledAt))
+        end
+        return added
+    end
     schedule = record.schedule === nothing ? nothing : parseCron(record.schedule)
     policy = record.overlap_policy === nothing ? nothing : Symbol(record.overlap_policy)
     options = JobOptions(policy, record.retries, record.retry_delays, nothing,
@@ -619,7 +626,8 @@ end
     getJobs(store) -> Vector{Job}
 
 Return every stored job, regardless of disabled status. A job added to `store`
-in this process carries its action; any other stored job has `action === nothing`.
+in this process is returned as the added `Job` object, with its action; any
+other stored job has `action === nothing`.
 """
 function getJobs(store::Store)
     jobs = Job[]
@@ -687,7 +695,8 @@ end
     disableJob!(store, job; at=Dates.now(UTC))
 
 Disable a stored job by reference or name. The update uses the backend atomic
-read-modify-write operation.
+read-modify-write operation. The job added to `store` under that name in this
+process is disabled too, so running schedulers stop it.
 """
 function disableJob!(
     store::Store,
