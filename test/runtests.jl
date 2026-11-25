@@ -1121,6 +1121,31 @@ end
     close(scheduler; timeout=3)
 end
 
+@testset "Disabling stops jobs queued before run!" begin
+    # A job pushed before run! (the README's order) stops once disabled, by object
+    # (`disable!(job)`) or by name (`disableJob!(store, name)`)
+    store = Tempus.InMemoryStore()
+    ran = Channel{String}(100)
+    by_object = Tempus.Job(() -> put!(ran, "by_object"), "disabled_by_object", "* * * * * *")
+    by_name = Tempus.Job(() -> put!(ran, "by_name"), "disabled_by_name", "* * * * * *")
+    scheduler = Tempus.Scheduler(store; logging=false)
+    push!(scheduler, by_object)
+    push!(scheduler, by_name)
+    try
+        # holding the lock keeps the dispatch loop from starting until both are disabled
+        @lock scheduler.lock begin
+            Tempus.run!(scheduler; close_when_no_jobs=true)
+            Tempus.disable!(by_object)
+            Tempus.disableJob!(store, "disabled_by_name")
+        end
+        # their queued executions come due, are dropped, and the loop stops
+        @test waitfor(() -> @lock(scheduler.lock, !scheduler.loopActive), 10)
+        @test !isready(ran)
+    finally
+        close(scheduler; timeout=2)
+    end
+end
+
 @testset "Job-level retries=0 overrides the scheduler's retries" begin
     # A job's explicit `retries=0` overrides the scheduler's retries; a job that
     # leaves `retries` unset uses them
