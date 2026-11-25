@@ -29,7 +29,15 @@ jobs:
           - windows-latest
         arch:
           - x64
+        # The newer ubuntu-latest image refuses Julia 1.10.0's libopenlibm, which
+        # asks for an executable stack, so the min job runs on ubuntu-24.04.
+        exclude:
+          - os: ubuntu-latest
+            version: 'min'
         include:
+          - os: ubuntu-24.04
+            arch: x64
+            version: 'min'
           - os: macOS-latest
             arch: aarch64
             version: 1
