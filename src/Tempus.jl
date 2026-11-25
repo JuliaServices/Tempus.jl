@@ -113,7 +113,7 @@ Defines options for job execution behavior.
 # Fields:
 - `overlap_policy::Union{Symbol, Nothing}`: Determines job execution behavior when the same job is already running (`:skip`, `:queue`, `:concurrent`).
 - `retries::Int`: Number of retries allowed on failure.
-- `retry_delays::Union{Base.ExponentialBackOff, Nothing}`: Delay strategy for retries (defaults to exponential backoff if `retries > 0`).
+- `retry_delays::Union{Base.ExponentialBackOff, Nothing}`: Delay strategy for retries. Giving `retries`, including `0`, defaults it to `Base.ExponentialBackOff(; n=retries)`; `nothing` (neither option given) uses the scheduler's retry settings.
 - `retry_check`: Custom function `(state, exception) -> Bool` deciding whether a failed attempt is retried (the `check` argument of `Base.retry`); stored as an internal callback wrapper. In a binary compiled with `juliac --trim`, declare its exception argument `@nospecialize`.
 - `max_failed_executions::Union{Int, Nothing}`: Number of consecutive failed executions that disables a job.
 - `max_executions::Union{Int, Nothing}`: Maximum number of successful executions in the retained history.
@@ -158,14 +158,16 @@ struct JobOptions
 end
 
 # `retry_check::R`: a function argument the method only passes along would not
-# be specialized on, leaving the callback construction dynamically dispatched
-function JobOptions(; overlap_policy=nothing, retries=0,
-        retry_delays=retries > 0 ? Base.ExponentialBackOff(; n=retries) : nothing,
+# be specialized on, leaving the callback construction dynamically dispatched.
+# A negative `retries` leaves `retry_delays` at `nothing`, so the inner
+# constructor reports it as an `ArgumentError`.
+function JobOptions(; overlap_policy=nothing, retries=nothing,
+        retry_delays=retries === nothing || retries < 0 ? nothing : Base.ExponentialBackOff(; n=retries),
         retry_check::R=nothing, max_failed_executions=nothing, max_executions=nothing,
         expires_at=nothing, timezone=nothing) where {R}
     check = retry_check === nothing ? nothing : Callback{RetryCheckCall}(retry_check)
     tz = timezone === nothing ? nothing : String(timezone)
-    return JobOptions(convert(Union{Symbol, Nothing}, overlap_policy), convert(Int, retries),
+    return JobOptions(convert(Union{Symbol, Nothing}, overlap_policy), convert(Int, something(retries, 0)),
                       convert(Union{Base.ExponentialBackOff, Nothing}, retry_delays), check,
                       convert(Union{Int, Nothing}, max_failed_executions),
                       convert(Union{Int, Nothing}, max_executions),
