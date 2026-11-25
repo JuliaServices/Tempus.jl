@@ -1146,6 +1146,19 @@ end
     end
 end
 
+@testset "Job-level retries=0 overrides the scheduler's retries" begin
+    # A job's explicit `retries=0` overrides the scheduler's retries; a job that
+    # leaves `retries` unset uses them
+    for (options, attempts_expected) in (((; retries=0), 1), ((;), 3))
+        attempts = Ref(0)
+        job = Tempus.OneShotJob(() -> (attempts[] += 1; error("boom")), "retries_override";
+            max_failed_executions=1, options...)
+        Tempus.runJobs!(Tempus.InMemoryStore(), [job]; retries=2,
+            retry_delays=Base.ExponentialBackOff(n=2, first_delay=0.001), logging=false)
+        @test attempts[] == attempts_expected
+    end
+end
+
 @testset "Options validation" begin
     @test_throws ArgumentError Tempus.Job(() -> nothing, "v1", "* * * * *"; overlap_policy=:sometimes)
     @test_throws ArgumentError Tempus.Job(() -> nothing, "v2", "* * * * *"; timezone="America/Nowhere")
